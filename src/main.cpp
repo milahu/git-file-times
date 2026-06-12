@@ -1,3 +1,5 @@
+#define DEBUG false
+
 #include <git2.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,20 +73,20 @@ static int tree_cb(
     // auto *ctx = static_cast<CommitCtx*>(payload);
 
     if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB) {
-        std::cerr << "no blob\n";
+        if (DEBUG) std::cerr << "no blob\n";
         return 0;
     }
 
     const char *name = git_tree_entry_name(entry);
     if (!name) {
-        std::cerr << "empty name\n";
+        if (DEBUG) std::cerr << "empty name\n";
         return 0;
     }
 
     std::string path = join_path(root, name);
 
     // debug
-    std::cerr << "path=" << path
+    if (DEBUG) std::cerr << "path=" << path
         << " commit=" << git_oid_tostr_s(ctx->oid)
         // these are the same times
         // << " ctx->commit->time=" << git_commit_time(ctx->commit)
@@ -224,22 +226,24 @@ static int diff_cb(
     bool has_old = oldf->path && oldf->path[0];
     bool has_new = newf->path && newf->path[0];
 
-    // debug
-    std::cerr << "path=" << path
-        << " commit=" << git_oid_tostr_s(ctx->oid)
-        // these are the same times
-        // << " ctx->commit->time=" << git_commit_time(ctx->commit)
-        // << " ctx->time=" << ctx->time
-        << " time=" << ctx->time
-        << " status=" << delta->status
-        << " old=" << (delta->old_file.path ?: "")
-        << " new=" << (delta->new_file.path ?: "")
-        << " old_size=" << delta->old_file.size
-        << " new_size=" << delta->new_file.size
-        << " is_rename=" << ((delta->status == GIT_DELTA_RENAMED) ? "1" : "0")
-        << " is_remaining=" << ctx->remaining.count(path)
-        << " is_seen=" << ctx->seen.count(path)
-        << "\n";
+    if (DEBUG) {
+        // debug
+        std::cerr << "path=" << path
+            << " commit=" << git_oid_tostr_s(ctx->oid)
+            // these are the same times
+            // << " ctx->commit->time=" << git_commit_time(ctx->commit)
+            // << " ctx->time=" << ctx->time
+            << " time=" << ctx->time
+            << " status=" << delta->status
+            << " old=" << (delta->old_file.path ?: "")
+            << " new=" << (delta->new_file.path ?: "")
+            << " old_size=" << delta->old_file.size
+            << " new_size=" << delta->new_file.size
+            << " is_rename=" << ((delta->status == GIT_DELTA_RENAMED) ? "1" : "0")
+            << " is_remaining=" << ctx->remaining.count(path)
+            << " is_seen=" << ctx->seen.count(path)
+            << "\n";
+    }
 
     if (delta->status == GIT_DELTA_DELETED) {
         // this is confusing, because path is in ctx->remaining
