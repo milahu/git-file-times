@@ -1,7 +1,7 @@
 // how often to call print_stats
-#define PRINT_STATS_EVERY_N_COMMITS 1000 // ~ every 100 seconds
+#define PRINT_STATS_EVERY_N_COMMITS 100 // ~ every 10 seconds
 
-#define DEBUG false
+#define DEBUG true
 
 #include <git2.h>
 #include <unordered_map>
@@ -12,6 +12,26 @@
 #include <memory>
 #include <chrono>
 #include <atomic>
+#include <cstring>
+
+struct BlobInfo {
+    git_time_t time = 0;
+    bool done = false;
+};
+
+struct OidHash {
+    size_t operator()(const git_oid& oid) const noexcept {
+        uint64_t v;
+        memcpy(&v, oid.id, sizeof(v));
+        return std::hash<uint64_t>{}(v);
+    }
+};
+
+struct OidEq {
+    bool operator()(const git_oid& a, const git_oid& b) const noexcept {
+        return git_oid_equal(&a, &b);
+    }
+};
 
 struct Context {
     std::unordered_map<std::string, git_time_t> seen;
@@ -23,6 +43,12 @@ struct Context {
     // const git_oid *oid; // debug
     git_oid *oid; // debug
     git_commit *commit; // debug
+
+    std::unordered_map<git_oid, git_time_t, OidHash, OidEq> blob_time;
+    std::unordered_set<git_oid, OidHash, OidEq> remaining_blobs;
+    std::unordered_map<std::string, git_oid> head_paths;
+
+    size_t total_blobs = 0;
 
     // stats
     size_t commits = 0;
@@ -378,7 +404,9 @@ void print_stats(Context &ctx)
 
     ctx.last_print_time = now;
 
-    size_t remaining = ctx.remaining.size();
+    // size_t remaining = ctx.remaining.size();
+    size_t remaining = ctx.remaining_blobs.size();
+
     size_t total = ctx.files_found + remaining;
 
     double commits_per_sec = ctx.commits / (elapsed + 1e-9);
@@ -399,6 +427,247 @@ void print_stats(Context &ctx)
         << " progress=" << (progress * 100.0) << "%\n";
 }
 
+void collect_head_tree(
+    git_repository* repo,
+    git_tree* tree,
+    const std::string& prefix,
+    Context& ctx)
+{
+    size_t n = git_tree_entrycount(tree);
+
+    for (size_t i = 0; i < n; ++i) {
+
+        auto* e = git_tree_entry_byindex(tree, i);
+
+        std::string path =
+            prefix +
+            git_tree_entry_name(e);
+
+        switch (git_tree_entry_type(e)) {
+
+        case GIT_OBJECT_BLOB: {
+
+            git_oid oid =
+                *git_tree_entry_id(e);
+
+            ctx.head_paths[path] = oid;
+
+            ctx.remaining_blobs.emplace(oid);
+
+            break;
+        }
+
+        case GIT_OBJECT_TREE: {
+
+            git_tree* sub;
+
+            git_tree_lookup(
+                &sub,
+                repo,
+                git_tree_entry_id(e)
+            );
+
+            collect_head_tree(
+                repo,
+                sub,
+                path + "/",
+                ctx
+            );
+
+            git_tree_free(sub);
+
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+}
+
+inline void resolve_blob(
+    Context& ctx,
+    const git_oid* oid,
+    git_time_t time)
+{
+    auto it =
+        ctx.remaining_blobs.find(*oid);
+
+    if (it == ctx.remaining_blobs.end())
+        return;
+
+    ctx.blob_time[*oid] = time;
+
+    ctx.remaining_blobs.erase(it);
+    ctx.files_found++;
+}
+
+void compare_trees(
+    git_repository* repo,
+    git_tree* parent,
+    git_tree* current,
+    git_time_t time,
+    Context& ctx
+)
+{
+    const size_t n_old = parent ? git_tree_entrycount(parent) : 0;
+    const size_t n_new = current ? git_tree_entrycount(current) : 0;
+
+    size_t i = 0, j = 0;
+
+    while (i < n_old || j < n_new)
+    {
+        const git_tree_entry* e_old =
+            (i < n_old)
+                ? git_tree_entry_byindex(parent, i)
+                : nullptr;
+
+        const git_tree_entry* e_new =
+            (j < n_new)
+                ? git_tree_entry_byindex(current, j)
+                : nullptr;
+
+        const char* name_old =
+            e_old ? git_tree_entry_name(e_old) : nullptr;
+
+        const char* name_new =
+            e_new ? git_tree_entry_name(e_new) : nullptr;
+
+        // pick lexicographically smaller path
+        int cmp;
+
+        if (!e_old) cmp = 1;
+        else if (!e_new) cmp = -1;
+        else cmp = strcmp(name_old, name_new);
+
+        // --- only in old tree (deletion) ---
+        if (cmp < 0)
+        {
+            // old file removed in this commit
+            // ignore for "latest modification of HEAD blob"
+            ++i;
+            continue;
+        }
+
+        // --- only in new tree (addition) ---
+        if (cmp > 0)
+        {
+            const git_tree_entry* ne = e_new;
+
+            git_object_t t = git_tree_entry_type(ne);
+
+            if (t == GIT_OBJECT_BLOB)
+            {
+                const git_oid* oid = git_tree_entry_id(ne);
+
+                auto it = ctx.remaining_blobs.find(*oid);
+
+                if (it != ctx.remaining_blobs.end())
+                {
+                    ctx.blob_time[*oid] = time;
+                    ctx.remaining_blobs.erase(it);
+                    ctx.files_found++;
+                }
+            }
+            else if (t == GIT_OBJECT_TREE)
+            {
+                git_tree* sub;
+
+                git_tree_lookup(
+                    &sub,
+                    repo,
+                    git_tree_entry_id(ne)
+                );
+
+                compare_trees(
+                    repo,
+                    nullptr,
+                    sub,
+                    time,
+                    ctx
+                );
+
+                git_tree_free(sub);
+            }
+
+            ++j;
+            continue;
+        }
+
+        // --- same name exists in both trees ---
+        const git_tree_entry* oe = e_old;
+        const git_tree_entry* ne = e_new;
+
+        git_object_t ot = git_tree_entry_type(oe);
+        git_object_t nt = git_tree_entry_type(ne);
+
+        const git_oid* oid_old = git_tree_entry_id(oe);
+        const git_oid* oid_new = git_tree_entry_id(ne);
+
+        // blob -> blob
+        if (ot == GIT_OBJECT_BLOB && nt == GIT_OBJECT_BLOB)
+        {
+            if (!git_oid_equal(oid_old, oid_new))
+            {
+                auto it = ctx.remaining_blobs.find(*oid_new);
+
+                if (it != ctx.remaining_blobs.end())
+                {
+                    ctx.blob_time[*oid_new] = time;
+                    ctx.remaining_blobs.erase(it);
+                    ctx.files_found++;
+                }
+            }
+
+            ++i;
+            ++j;
+            continue;
+        }
+
+        // tree -> tree
+        if (ot == GIT_OBJECT_TREE && nt == GIT_OBJECT_TREE)
+        {
+            git_tree* old_sub;
+            git_tree* new_sub;
+
+            git_tree_lookup(&old_sub, repo, oid_old);
+            git_tree_lookup(&new_sub, repo, oid_new);
+
+            compare_trees(
+                repo,
+                old_sub,
+                new_sub,
+                time,
+                ctx
+            );
+
+            git_tree_free(old_sub);
+            git_tree_free(new_sub);
+
+            ++i;
+            ++j;
+            continue;
+        }
+
+        // type change (rare: file->dir or dir->file)
+        if (nt == GIT_OBJECT_BLOB)
+        {
+            const git_oid* oid = oid_new;
+
+            auto it = ctx.remaining_blobs.find(*oid);
+
+            if (it != ctx.remaining_blobs.end())
+            {
+                ctx.blob_time[*oid] = time;
+                ctx.remaining_blobs.erase(it);
+            }
+        }
+
+        ++i;
+        ++j;
+    }
+}
+
 int main() {
     git_libgit2_init();
 
@@ -410,32 +679,103 @@ int main() {
         return 1;
     }
 
+    auto ctx = std::make_unique<Context>();
+
+    ctx->start_time = std::chrono::steady_clock::now();
+    ctx->last_print_time = ctx->start_time;
+
+    git_object* obj;
+
+    git_revparse_single(&obj, repo, "HEAD^{tree}");
+
+    collect_head_tree(repo, (git_tree*)obj, "", *ctx);
+
+    ctx->total_blobs = ctx->remaining_blobs.size();
+
+    // git_revwalk* walk;
+
     git_revwalk_new(&walk, repo);
-
-    // no effect?
-    // git_revwalk_sorting(walk, GIT_SORT_TIME | GIT_SORT_TOPOLOGICAL);
-    // git_revwalk_sorting(walk, GIT_SORT_TIME);
-
-    // no, this returns empty output
-    // git_revwalk_hide_glob(walk, "*");
 
     git_revwalk_push_head(walk);
 
     git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL);
 
-    // no, this makes it worse
-    // get only commits of the current branch
-    // git_revwalk_simplify_first_parent(walk);
+    git_oid oid;
 
-    // not working?
-    // skip merge commits
-    // git_revwalk_hide_glob(walk, "merge");
+    while (
+        !ctx->remaining_blobs.empty() &&
+        !git_revwalk_next(&oid, walk)
+    )
+    {
 
-    // Context ctx; // segfault
-    auto ctx = std::make_unique<Context>();
+        ctx->commits++;
 
-    ctx->start_time = std::chrono::steady_clock::now();
-    ctx->last_print_time = ctx->start_time;
+        if (ctx->commits % PRINT_STATS_EVERY_N_COMMITS == 0) {
+            print_stats(*ctx);
+        }
+
+        git_commit* commit;
+
+        git_commit_lookup(&commit, repo, &oid);
+
+        git_tree* tree;
+
+        git_commit_tree(&tree, commit);
+
+        if (git_commit_parentcount(commit))
+        {
+            git_commit* parent;
+            git_commit_parent(&parent, commit, 0);
+
+            git_tree* parent_tree;
+
+            git_commit_tree(&parent_tree, parent);
+
+            compare_trees(
+                repo,
+                parent_tree,
+                tree,
+                git_commit_time(commit),
+                *ctx
+            );
+
+            git_tree_free(parent_tree);
+            git_commit_free(parent);
+        }
+        else
+        {
+            compare_trees(
+                repo,
+                nullptr,
+                tree,
+                git_commit_time(commit),
+                *ctx
+            );
+        }
+
+        git_tree_free(tree);
+        git_commit_free(commit);
+
+    }
+
+    // output result
+    for (auto const& [path, oid] : ctx->head_paths)
+    {
+        auto it = ctx->blob_time.find(oid);
+
+        if (it == ctx->blob_time.end())
+            continue;
+
+        std::cout
+            << it->second
+            << " "
+            << path
+            << "\n";
+    }
+
+
+
+    #if false
 
     // ctx->remaining = collect_head_tree(repo, &ctx);
     // ctx->remaining = collect_head_tree(repo, ctx.get());
@@ -475,6 +815,41 @@ int main() {
             git_commit_tree(&parent_tree, parent);
             git_commit_free(parent);
         }
+
+        if (1) {
+
+            // depth-first search
+            // find the latest commit of this file in this branch
+
+            for (auto it = ctx->remaining.begin(); it != ctx->remaining.end(); ) {
+                const std::string &path = *it;
+
+                if (DEBUG) std::cerr << "path=" << path << "\n";
+
+                git_tree_entry *entry = nullptr;
+                int err = git_tree_entry_bypath(&entry, tree, path.c_str());
+
+                if (err == 0) {
+                    ctx->result[path] = t;
+                    if (DEBUG) std::cerr << "  t=" << t << "\n";
+                    it = ctx->remaining.erase(it); // remove from future work
+                    ctx->files_found++;
+                } else {
+                    ++it;
+                }
+            }
+
+            git_tree_free(tree);
+            git_commit_free(commit);
+
+            if (ctx->remaining.empty())
+                break;
+
+            continue;
+
+        }
+
+
 
         // FIXME wrong time
         ctx->time = git_commit_time(commit);
@@ -531,5 +906,7 @@ int main() {
     for (const auto &kv : ctx->seen) {
         std::cout << kv.second << " " << kv.first << "\n";
     }
+
+    #endif
 
 }
