@@ -1,3 +1,6 @@
+// how often to call print_stats
+#define PRINT_STATS_EVERY_N_COMMITS 1000 // ~ every 100 seconds
+
 #define DEBUG false
 
 #include <git2.h>
@@ -7,6 +10,8 @@
 #include <string>
 #include <iostream>
 #include <memory>
+#include <chrono>
+#include <atomic>
 
 struct Context {
     std::unordered_map<std::string, git_time_t> seen;
@@ -18,6 +23,12 @@ struct Context {
     // const git_oid *oid; // debug
     git_oid *oid; // debug
     git_commit *commit; // debug
+
+    // stats
+    size_t commits = 0;
+    size_t files_found = 0;
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point last_print_time;
 };
 
 struct CommitCtx {
@@ -296,6 +307,7 @@ static int diff_cb(
     ) {
         ctx->seen[path] = ctx->time;
         ctx->remaining.erase(path);
+        ctx->files_found++;
     }
 
     /*
@@ -354,6 +366,39 @@ static int diff_cb(
 }
 #endif
 
+void print_stats(Context &ctx)
+{
+    using namespace std::chrono;
+
+    auto now = steady_clock::now();
+    double elapsed = duration_cast<duration<double>>(now - ctx.start_time).count();
+    double since_last = duration_cast<duration<double>>(now - ctx.last_print_time).count();
+
+    if (since_last < 0.5) return; // throttle output (2 Hz max)
+
+    ctx.last_print_time = now;
+
+    size_t remaining = ctx.remaining.size();
+    size_t total = ctx.files_found + remaining;
+
+    double commits_per_sec = ctx.commits / (elapsed + 1e-9);
+    double files_per_sec = ctx.files_found / (elapsed + 1e-9);
+    double progress = total ? (1.0 * ctx.files_found / total) : 0.0;
+
+    double eta = (1 - progress) * total / files_per_sec;
+
+    std::cerr
+        << "stats: "
+        << "commits=" << ctx.commits
+        << " time=" << elapsed
+        << " eta=" << eta
+        << " commits/s=" << commits_per_sec
+        << " files_done=" << ctx.files_found
+        << " files_left=" << remaining
+        << " files/s=" << files_per_sec
+        << " progress=" << (progress * 100.0) << "%\n";
+}
+
 int main() {
     git_libgit2_init();
 
@@ -389,6 +434,9 @@ int main() {
     // Context ctx; // segfault
     auto ctx = std::make_unique<Context>();
 
+    ctx->start_time = std::chrono::steady_clock::now();
+    ctx->last_print_time = ctx->start_time;
+
     // ctx->remaining = collect_head_tree(repo, &ctx);
     // ctx->remaining = collect_head_tree(repo, ctx.get());
     ctx->remaining = collect_head_tree(repo);
@@ -396,6 +444,12 @@ int main() {
     git_oid oid;
 
     while (!git_revwalk_next(&oid, walk)) {
+
+        ctx->commits++;
+
+        if (ctx->commits % PRINT_STATS_EVERY_N_COMMITS == 0) {
+            print_stats(*ctx);
+        }
 
         // std::cerr << "commit: " << git_oid_tostr_s(&oid) << "\n"; // debug
 
