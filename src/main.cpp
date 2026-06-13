@@ -216,7 +216,7 @@ int main() {
     // Topological order is not cache-friendly.
     // git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL);
     // git_revwalk_sorting(walk, GIT_SORT_TIME);
-    git_revwalk_sorting(walk, GIT_SORT_TIME | GIT_SORT_REVERSE);
+    git_revwalk_sorting(walk, GIT_SORT_REVERSE);
 
     auto ctx = std::make_unique<Context>();
 

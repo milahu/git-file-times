@@ -1,50 +1,26 @@
 nixpkgs $ git-file-times >file-times.txt
-stats: commits=1000 time=13.9306 eta=10879.2 commits/s=71.7845 files_done=67 files_left=52324 files/s=4.80956 deltas/s=373.71 progress=0.127885%
-stats: commits=2000 time=17.001 eta=6175.97 commits/s=325.692 files_done=93 files_left=52298 files/s=8.46798 deltas/s=925.29 progress=0.177511%
-stats: commits=3000 time=21.4174 eta=23092.5 commits/s=226.428 files_done=103 files_left=52288 files/s=2.26428 deltas/s=673.398 progress=0.196599%
-stats: commits=4000 time=30.8079 eta=19631.1 commits/s=106.49 files_done=128 files_left=52263 files/s=2.66225 deltas/s=308.609 progress=0.244317%
-stats: commits=5000 time=48.2343 eta=113827 commits/s=57.3843 files_done=136 files_left=52255 files/s=0.459074 deltas/s=172.497 progress=0.259587%
-stats: commits=6000 time=70.3101 eta=26195.4 commits/s=45.2985 files_done=180 files_left=52211 files/s=1.99313 deltas/s=101.106 progress=0.34357%
-stats: commits=7000 time=96.8322 eta=86520.2 commits/s=37.7044 files_done=196 files_left=52195 files/s=0.60327 deltas/s=84.3069 progress=0.37411%
-stats: commits=8000 time=123.78 eta=56234.9 commits/s=37.1086 files_done=221 files_left=52170 files/s=0.927715 deltas/s=78.262 progress=0.421828%
-stats: commits=9000 time=154.222 eta=72157.3 commits/s=32.85 files_done=243 files_left=52148 files/s=0.722699 deltas/s=93.4582 progress=0.46382%
-stats: commits=10000 time=191.06 eta=240096 commits/s=27.1454 files_done=251 files_left=52140 files/s=0.217163 deltas/s=57.2496 progress=0.47909%
-stats: commits=11000 time=232.305 eta=89562.6 commits/s=24.2456 files_done=275 files_left=52116 files/s=0.581895 deltas/s=65.0025 progress=0.524899%
-stats: commits=12000 time=275.088 eta=185763 commits/s=23.3739 files_done=287 files_left=52104 files/s=0.280487 deltas/s=47.9632 progress=0.547804%
-stats: commits=13000 time=323.132 eta=227525 commits/s=20.8141 files_done=298 files_left=52093 files/s=0.228955 deltas/s=41.2327 progress=0.5688%
-stats: commits=14000 time=372.421 eta=171124 commits/s=20.2885 files_done=313 files_left=52078 files/s=0.304328 deltas/s=46.1767 progress=0.597431%
-stats: commits=15000 time=423.921 eta=243768 commits/s=19.4175 files_done=324 files_left=52067 files/s=0.213592 deltas/s=36.2719 progress=0.618427%
-stats: commits=16000 time=479.55 eta=87715.2 commits/s=17.9762 files_done=357 files_left=52034 files/s=0.593215 deltas/s=35.0896 progress=0.681415%
-stats: commits=17000 time=536.959 eta=497814 commits/s=17.4188 files_done=363 files_left=52028 files/s=0.104513 deltas/s=35.0641 progress=0.692867%
-stats: commits=18000 time=602.395 eta=486289 commits/s=15.2822 files_done=370 files_left=52021 files/s=0.106976 deltas/s=26.7439 progress=0.706228%
-stats: commits=19000 time=675.594 eta=543911 commits/s=13.6614 files_done=377 files_left=52014 files/s=0.0956297 deltas/s=40.9295 progress=0.719589%
-stats: commits=20000 time=747.792 eta=197576 commits/s=13.8508 files_done=396 files_left=51995 files/s=0.263165 deltas/s=23.8926 progress=0.755855%
-stats: commits=21000 time=822.015 eta=643128 commits/s=13.4729 files_done=402 files_left=51989 files/s=0.0808377 deltas/s=32.7527 progress=0.767307%
-stats: commits=22000 time=899.904 eta=168646 commits/s=12.8388 files_done=426 files_left=51965 files/s=0.308131 deltas/s=45.1669 progress=0.813117%
-stats: commits=23000 time=965.664 eta=227750 commits/s=15.2067 files_done=441 files_left=51950 files/s=0.228101 deltas/s=39.4311 progress=0.841748%
-stats: commits=24000 time=1034.99 eta=300036 commits/s=14.4255 files_done=453 files_left=51938 files/s=0.173106 deltas/s=26.442 progress=0.864652%
-stats: commits=25000 time=1101.85 eta=267087 commits/s=14.9548 files_done=466 files_left=51925 files/s=0.194412 deltas/s=22.163 progress=0.889466%
-stats: commits=26000 time=1178.88 eta=999778 commits/s=12.9831 files_done=470 files_left=51921 files/s=0.0519325 deltas/s=19.5266 progress=0.897101%
-stats: commits=27000 time=1254.62 eta=983064 commits/s=13.2029 files_done=474 files_left=51917 files/s=0.0528114 deltas/s=18.8537 progress=0.904736%
-stats: commits=28000 time=1334.29 eta=258425 commits/s=12.5522 files_done=490 files_left=51901 files/s=0.200836 deltas/s=24.8911 progress=0.935275%
-stats: commits=29000 time=1414.86 eta=348412 commits/s=12.4108 files_done=502 files_left=51889 files/s=0.14893 deltas/s=20.6268 progress=0.95818%
-stats: commits=30000 time=1501.51 eta=749307 commits/s=11.5402 files_done=508 files_left=51883 files/s=0.0692413 deltas/s=30.7201 progress=0.969632%
-stats: commits=31000 time=1580.88 eta=1.02932e+06 commits/s=12.6003 files_done=512 files_left=51879 files/s=0.0504013 deltas/s=19.5431 progress=0.977267%
-stats: commits=32000 time=1667.27 eta=224010 commits/s=11.5752 files_done=532 files_left=51859 files/s=0.231503 deltas/s=29.262 progress=1.01544%
-stats: commits=33000 time=1753.12 eta=556426 commits/s=11.6482 files_done=540 files_left=51851 files/s=0.0931858 deltas/s=18.742 progress=1.03071%
-stats: commits=34000 time=1837.84 eta=365979 commits/s=11.8037 files_done=552 files_left=51839 files/s=0.141645 deltas/s=20.6211 progress=1.05362%
-stats: commits=35000 time=1926.98 eta=2.31044e+06 commits/s=11.218 files_done=554 files_left=51837 files/s=0.022436 deltas/s=18.1283 progress=1.05743%
-stats: commits=36000 time=2033.11 eta=17469.7 commits/s=9.4228 files_done=867 files_left=51524 files/s=2.94934 deltas/s=27.4486 progress=1.65486%
-stats: commits=37000 time=2142.95 eta=707342 commits/s=9.1038 files_done=875 files_left=51516 files/s=0.0728304 deltas/s=12.545 progress=1.67013%
-stats: commits=38000 time=2256.31 eta=973161 commits/s=8.82176 files_done=881 files_left=51510 files/s=0.0529306 deltas/s=10.8949 progress=1.68159%
-stats: commits=39000 time=2370.16 eta=325711 commits/s=8.78284 files_done=899 files_left=51492 files/s=0.158091 deltas/s=13.2796 progress=1.71594%
-stats: commits=40000 time=2488.14 eta=319605 commits/s=8.47642 files_done=918 files_left=51473 files/s=0.161052 deltas/s=14.2658 progress=1.75221%
-stats: commits=41000 time=2601.69 eta=449473 commits/s=8.8069 files_done=931 files_left=51460 files/s=0.11449 deltas/s=11.3257 progress=1.77702%
-stats: commits=42000 time=2720.32 eta=381447 commits/s=8.4291 files_done=947 files_left=51444 files/s=0.134866 deltas/s=10.4605 progress=1.80756%
-stats: commits=43000 time=2840.73 eta=257982 commits/s=8.30484 files_done=971 files_left=51420 files/s=0.199316 deltas/s=18.3952 progress=1.85337%
-stats: commits=44000 time=2963.26 eta=572632 commits/s=8.16152 files_done=982 files_left=51409 files/s=0.0897767 deltas/s=13.5563 progress=1.87437%
-stats: commits=45000 time=3081.17 eta=318907 commits/s=8.48127 files_done=1001 files_left=51390 files/s=0.161144 deltas/s=10.9239 progress=1.91063%
+stats: commits=1000 time=29.548 eta=23075.7 commits/s=33.8433 files_done=67 files_left=52324 files/s=2.2675 deltas/s=176.188 progress=0.127885%
+stats: commits=2000 time=33.018 eta=6979.7 commits/s=288.187 files_done=93 files_left=52298 files/s=7.49287 deltas/s=818.74 progress=0.177511%
+stats: commits=3000 time=37.9136 eta=25598.3 commits/s=204.264 files_done=103 files_left=52288 files/s=2.04264 deltas/s=607.481 progress=0.196599%
+stats: commits=4000 time=53.1826 eta=31920.1 commits/s=65.4922 files_done=128 files_left=52263 files/s=1.63731 deltas/s=189.796 progress=0.244317%
+stats: commits=5000 time=73.9739 eta=135806 commits/s=48.097 files_done=136 files_left=52255 files/s=0.384776 deltas/s=144.58 progress=0.259587%
+stats: commits=6000 time=96.6638 eta=26924.2 commits/s=44.0725 files_done=180 files_left=52211 files/s=1.93919 deltas/s=98.3697 progress=0.34357%
+stats: commits=7000 time=123.743 eta=88336.8 commits/s=36.929 files_done=196 files_left=52195 files/s=0.590864 deltas/s=82.5732 progress=0.37411%
+stats: commits=8000 time=151.81 eta=58570.4 commits/s=35.6289 files_done=221 files_left=52170 files/s=0.890723 deltas/s=75.1414 progress=0.421828%
+stats: commits=9000 time=181.163 eta=69577.5 commits/s=34.068 files_done=243 files_left=52148 files/s=0.749495 deltas/s=96.9233 progress=0.46382%
+stats: commits=10000 time=216.97 eta=233374 commits/s=27.9273 files_done=251 files_left=52140 files/s=0.223418 deltas/s=58.8987 progress=0.47909%
+stats: commits=11000 time=256.888 eta=86681.3 commits/s=25.0515 files_done=275 files_left=52116 files/s=0.601237 deltas/s=67.1631 progress=0.524899%
+stats: commits=12000 time=298.252 eta=179604 commits/s=24.1754 files_done=287 files_left=52104 files/s=0.290104 deltas/s=49.6078 progress=0.547804%
+stats: commits=13000 time=347.101 eta=231334 commits/s=20.4714 files_done=298 files_left=52093 files/s=0.225185 deltas/s=40.5538 progress=0.5688%
+stats: commits=14000 time=394.01 eta=162860 commits/s=21.318 files_done=313 files_left=52078 files/s=0.319771 deltas/s=48.5199 progress=0.597431%
+stats: commits=15000 time=443.199 eta=232829 commits/s=20.3297 files_done=324 files_left=52067 files/s=0.223627 deltas/s=37.976 progress=0.618427%
+stats: commits=16000 time=496.092 eta=83401.2 commits/s=18.9061 files_done=357 files_left=52034 files/s=0.6239 deltas/s=36.9046 progress=0.681415%
+stats: commits=17000 time=550.996 eta=476095 commits/s=18.2135 files_done=363 files_left=52028 files/s=0.109281 deltas/s=36.6637 progress=0.692867%
+stats: commits=18000 time=613.66 eta=465689 commits/s=15.9582 files_done=370 files_left=52021 files/s=0.111708 deltas/s=27.9269 progress=0.706228%
+stats: commits=19000 time=682.949 eta=514857 commits/s=14.4323 files_done=377 files_left=52014 files/s=0.101026 deltas/s=43.2392 progress=0.719589%
+stats: commits=20000 time=750.87 eta=185871 commits/s=14.723 files_done=396 files_left=51995 files/s=0.279737 deltas/s=25.3972 progress=0.755855%
+stats: commits=21000 time=821.94 eta=615812 commits/s=14.0706 files_done=402 files_left=51989 files/s=0.0844235 deltas/s=34.2056 progress=0.767307%
 ^C
-real    52m18,010s
-user    51m0,533s
-sys     0m7,070s
+real    13m45,251s
+user    13m17,401s
+sys     0m4,586s
