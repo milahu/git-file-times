@@ -12,15 +12,43 @@
 #include <memory>
 #include <chrono>
 #include <atomic>
+#include <cstring>
+
+struct OidHash {
+    size_t operator()(const git_oid& oid) const noexcept {
+        // reduce the 160-bit oid to a 64-bit hash
+        // to assign the oid to a bucket in the unordered_set
+        // hash collisions are resolved via OidEq
+        uint64_t v;
+        memcpy(&v, oid.id, sizeof(v));
+        return std::hash<uint64_t>{}(v);
+    }
+};
+
+struct OidEq {
+    bool operator()(const git_oid& a, const git_oid& b) const noexcept {
+        return git_oid_equal(&a, &b);
+    }
+};
+
+struct BlobState {
+    std::string path;
+    git_time_t time = 0;
+    bool has_time = false;
+    bool ignore_next_add = false;
+};
+
+// TODO which is better, "using" or "typedef"?
+// using BlobStateMap = std::unordered_map<git_oid, BlobState, OidHash, OidEq>;
+typedef std::unordered_map<git_oid, BlobState, OidHash, OidEq> BlobStateMap;
 
 struct Context {
-    std::unordered_map<std::string, git_time_t> seen;
-    std::unordered_set<std::string> remaining;
-    std::unordered_set<std::string> ignore_next_add;
-    std::unordered_map<std::string, time_t> result;
+    BlobStateMap blobs;
+    size_t num_remaining;
     git_time_t time;
     git_oid *oid;
     git_commit *commit;
+    git_repository *repo;
     // stats
     size_t commits = 0;
     size_t files_found = 0;
@@ -32,13 +60,13 @@ struct Context {
     std::chrono::steady_clock::time_point last_print_time;
 };
 
-static std::unordered_set<std::string> collect_head_tree(git_repository *repo)
+static BlobStateMap collect_head_blobs(git_repository *repo)
 {
-    std::unordered_set<std::string> out;
+    BlobStateMap blobs;
 
     git_object *obj = nullptr;
     if (git_revparse_single(&obj, repo, "HEAD^{tree}") != 0 || !obj)
-        return out;
+        return blobs;
 
     git_tree *tree = (git_tree *)obj;
 
@@ -49,114 +77,154 @@ static std::unordered_set<std::string> collect_head_tree(git_repository *repo)
            const git_tree_entry *entry,
            void *payload) -> int
         {
-            auto *out = static_cast<std::unordered_set<std::string>*>(payload);
+            auto *blobs =
+                static_cast<BlobStateMap*>(payload);
 
             if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
                 return 0;
 
+            const git_oid *oid = git_tree_entry_id(entry);
             const char *name = git_tree_entry_name(entry);
-            if (!name) return 0;
 
-            // note: root ends with "/"
-            std::string path = root && *root
-                ? std::string(root) + name
-                : name;
+            if (!oid || !name)
+                return 0;
 
-            out->insert(std::move(path));
+            std::string path = (
+                (root && *root) ? std::string(root) + name
+                : std::string(name)                
+            );
+
+            BlobState state;
+            state.path = std::move(path);
+
+            blobs->emplace(*oid, std::move(state));
+
             return 0;
         },
-        &out
+        &blobs
     );
 
     git_tree_free(tree);
-    return out;
+
+    return blobs;
 }
 
-static int diff_cb(
-    const git_diff_delta *delta,
-    float progress,
-    void *payload)
+static void compare_tree(
+    git_tree *parent,
+    git_tree *current,
+    Context *ctx)
 {
-    auto *ctx = static_cast<Context *>(payload);
+    // parent and current entry index
+    size_t p = 0;
+    size_t c = 0;
 
-    ctx->deltas_seen++;
+    // parent and current tree size
+    const size_t parent_n = parent ? git_tree_entrycount(parent) : 0;
+    const size_t current_n = current ? git_tree_entrycount(current) : 0;
 
-    const char *new_path = delta->new_file.path;
+    // loop entries of parent and current tree in parallel
+    // exploit the fact that tree entries are sorted by name
+    while (p < parent_n || c < current_n) {
 
-    if (
-        !new_path ||
-        // path is not part of the HEAD tree
-        !ctx->remaining.count(new_path) ||
-        // path has been processed
-        ctx->seen.count(new_path)
-    ) {
-        return 0;
+        // parent and current entry
+        const git_tree_entry *pe = (
+            (p < parent_n) ? git_tree_entry_byindex(parent, p)
+            : nullptr
+        );
+        const git_tree_entry *ce = (
+            (c < current_n) ? git_tree_entry_byindex(current, c)
+            : nullptr
+        );
+
+        int cmp;
+        if (!pe) {
+            // end of parent tree
+            cmp = +1;
+        }
+        else if (!ce) {
+            // end of current tree
+            // cmp = -1;
+            break;
+        }
+        else {
+            // found parent and current entry
+            // compare entry names
+            cmp = strcmp(
+                git_tree_entry_name(pe),
+                git_tree_entry_name(ce)
+            );
+            // note: git_tree_entry_name does not return
+            // slash-suffixed names for tree entries
+            // std::cerr << "p_name=" << git_tree_entry_name(pe) << "\n";
+            // std::cerr << "c_name=" << git_tree_entry_name(ce) << "\n";
+        }
+
+        if (cmp == 0) {
+            // same entry name in parent and current tree
+            // compare entry contents
+            auto ptype = git_tree_entry_type(pe);
+            auto ctype = git_tree_entry_type(ce);
+            if (ptype == GIT_OBJECT_BLOB && ctype == GIT_OBJECT_BLOB)
+            {
+                // compare blob contents
+                const git_oid *poid = git_tree_entry_id(pe);
+                const git_oid *coid = git_tree_entry_id(ce);
+                if (!git_oid_equal(poid, coid)) {
+                    // blob changed in this commit
+                    auto it = ctx->blobs.find(*coid);
+                    if (it != ctx->blobs.end()) {
+                        it->second.time = ctx->time;
+                        it->second.has_time = true;
+                        ctx->num_remaining--;
+                        ctx->files_found++;
+                    }
+                }
+            }
+            else if (ptype == GIT_OBJECT_TREE && ctype == GIT_OBJECT_TREE)
+            {
+                // compare tree contents
+                const git_oid *poid = git_tree_entry_id(pe);
+                const git_oid *coid = git_tree_entry_id(ce);
+                if (!git_oid_equal(poid, coid)) {
+                    git_tree *ptree = nullptr;
+                    git_tree *ctree = nullptr;
+                    git_tree_lookup(&ptree, ctx->repo, poid);
+                    git_tree_lookup(&ctree, ctx->repo, coid);
+                    // recursion
+                    compare_tree(ptree, ctree, ctx);
+                    // free memory
+                    git_tree_free(ptree);
+                    git_tree_free(ctree);
+                }
+            }
+            // else: file type was changed. TODO what now?
+            ++p;
+            ++c;
+        }
+        else if (cmp == -1) {
+            // entry name exists only in parent tree
+            // entry was removed in current commit
+            // FIXME maybe entry was renamed
+            ++p;
+        }
+        else { // cmp == +1
+            // entry name exists only in current tree
+            // entry was added in current commit
+            // FIXME maybe entry was renamed
+            if (ce && git_tree_entry_type(ce) == GIT_OBJECT_BLOB)
+            {
+                const git_oid *coid = git_tree_entry_id(ce);
+                auto it = ctx->blobs.find(*coid);
+                if (it != ctx->blobs.end()) {
+                    it->second.time = ctx->time;
+                    it->second.has_time = true;
+                    ctx->num_remaining--;
+                    ctx->files_found++;
+                }
+            }
+            ++c;
+        }
     }
-
-    const git_diff_file *f = (
-        delta->new_file.path ? &delta->new_file
-        : &delta->old_file
-    );
-
-    if (!f->path) return 0;
-
-    const char *path = f->path;
-
-    const git_diff_file *oldf = &delta->old_file;
-    const git_diff_file *newf = &delta->new_file;
-
-    bool has_old = oldf->path && oldf->path[0];
-    bool has_new = newf->path && newf->path[0];
-
-    if (DEBUG) {
-        // debug
-        std::cerr << "path=" << path
-            << " commit=" << git_oid_tostr_s(ctx->oid)
-            << " time=" << ctx->time
-            << " status=" << delta->status
-            << " old=" << (delta->old_file.path ?: "")
-            << " new=" << (delta->new_file.path ?: "")
-            << " old_size=" << delta->old_file.size
-            << " new_size=" << delta->new_file.size
-            << " is_rename=" << ((delta->status == GIT_DELTA_RENAMED) ? "1" : "0")
-            << " is_remaining=" << ctx->remaining.count(path)
-            << " is_seen=" << ctx->seen.count(path)
-            << "\n";
-    }
-
-    if (delta->status == GIT_DELTA_DELETED) {
-        // this is confusing, because path is in ctx->remaining
-        // because path is present in the HEAD tree
-        // and there is no "add" commit between the "delete" commit and HEAD
-        // so we resolve this contradiction by ignoring the next "add" commit
-        ctx->ignore_next_add.emplace(path);
-        return 0;
-    }
-
-    if (delta->status == GIT_DELTA_ADDED && ctx->ignore_next_add.count(path)) {
-        ctx->ignore_next_add.erase(path);
-        return 0;
-    }
-
-    if (!has_old && has_new) {
-        return 0;
-    }
-
-    if (has_old && !has_new)
-        return 0;
-
-    if (!has_old && !has_new) // unreachable?
-        return 0;
-
-    // this requires git_diff_find_similar
-    if (delta->status == GIT_DELTA_RENAMED)
-        return 0;
-
-    ctx->seen[path] = ctx->time;
-    ctx->remaining.erase(path);
-    ctx->files_found++;
-
-    return 0;
 }
 
 void print_stats(Context &ctx)
@@ -171,8 +239,7 @@ void print_stats(Context &ctx)
 
     ctx.last_print_time = now;
 
-    size_t remaining = ctx.remaining.size();
-    size_t total = ctx.files_found + remaining;
+    size_t total = ctx.blobs.size();
 
     double commits_per_sec = (ctx.commits - ctx.last_commits) / since_last;
     double files_per_sec = (ctx.files_found - ctx.last_files_found) / since_last;
@@ -192,7 +259,7 @@ void print_stats(Context &ctx)
         << " eta=" << eta
         << " commits/s=" << commits_per_sec
         << " files_done=" << ctx.files_found
-        << " files_left=" << remaining
+        // << " files_left=" << remaining
         << " files/s=" << files_per_sec
         << " deltas/s=" << deltas_per_sec
         << " progress=" << (progress * 100.0) << "%\n";
@@ -224,7 +291,15 @@ int main() {
     ctx->start_time = std::chrono::steady_clock::now();
     ctx->last_print_time = ctx->start_time;
 
-    ctx->remaining = collect_head_tree(repo);
+    // ctx->remaining = collect_head_tree(repo);
+    ctx->blobs = collect_head_blobs(repo);
+
+    if (DEBUG) {
+        // std::cerr << "wanted blobs size: " << ctx->blobs.size() << "\n";
+        for (auto blob : ctx->blobs) {
+            // std::cerr << "wanted blob: " << git_oid_tostr_s(&blob.first) << " " << blob.second.path << "\n";
+        }
+    }
 
     git_oid oid;
 
@@ -263,35 +338,22 @@ int main() {
         ctx->time = git_commit_time(commit);
         ctx->oid = &oid;
         ctx->commit = commit;
-
-        git_diff *diff = nullptr;
+        ctx->repo = repo;
 
         git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
         opts.flags |= GIT_DIFF_INCLUDE_UNTRACKED;
 
-        git_diff_tree_to_tree(&diff, repo, parent_tree, tree, &opts);
-
-        // loop files
-        git_diff_foreach(
-            diff,
-            diff_cb,
-            // TODO add binary_cb?
-            nullptr,
-            nullptr,
-            nullptr,
-            ctx.get()
-        );
+        compare_tree(parent_tree, tree, ctx.get());
 
         // free memory
-        git_diff_free(diff);
         if (parent_tree)
             git_tree_free(parent_tree);
         git_tree_free(tree);
         git_commit_free(commit);
 
-        // stop early
-        if (ctx->remaining.empty())
-            break;
+        // // stop early
+        // if (ctx->remaining.empty())
+        //     break;
     }
 
     git_revwalk_free(walk);
@@ -300,8 +362,8 @@ int main() {
     git_libgit2_shutdown();
 
     // output result
-    for (const auto &kv : ctx->seen) {
-        std::cout << kv.second << " " << kv.first << "\n";
+    for (const auto &kv : ctx->blobs) {
+        std::cout << kv.second.time << " " << kv.second.path << "\n";
     }
 
 }
