@@ -26,6 +26,8 @@ struct Context {
     size_t files_found = 0;
     size_t last_commits = 0;
     size_t last_files_found = 0;
+    size_t deltas_seen = 0;
+    size_t last_deltas_seen = 0;
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point last_print_time;
 };
@@ -76,6 +78,8 @@ static int diff_cb(
     void *payload)
 {
     auto *ctx = static_cast<Context *>(payload);
+
+    ctx->deltas_seen++;
 
     const char *new_path = delta->new_file.path;
 
@@ -172,10 +176,12 @@ void print_stats(Context &ctx)
 
     double commits_per_sec = (ctx.commits - ctx.last_commits) / since_last;
     double files_per_sec = (ctx.files_found - ctx.last_files_found) / since_last;
+    double deltas_per_sec = (ctx.deltas_seen - ctx.last_deltas_seen) / since_last;
     double progress = total ? (1.0 * ctx.files_found / total) : 0.0;
 
     ctx.last_commits = ctx.commits;
     ctx.last_files_found = ctx.files_found;
+    ctx.last_deltas_seen = ctx.deltas_seen;
 
     double eta = (1 - progress) * total / files_per_sec;
 
@@ -188,6 +194,7 @@ void print_stats(Context &ctx)
         << " files_done=" << ctx.files_found
         << " files_left=" << remaining
         << " files/s=" << files_per_sec
+        << " deltas/s=" << deltas_per_sec
         << " progress=" << (progress * 100.0) << "%\n";
 }
 
