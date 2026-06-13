@@ -267,6 +267,10 @@ int main() {
             git_tree_free(parent_tree);
         git_tree_free(tree);
         git_commit_free(commit);
+
+        // stop early
+        if (ctx->remaining.empty())
+            break;
     }
 
     git_revwalk_free(walk);
