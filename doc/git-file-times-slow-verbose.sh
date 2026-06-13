@@ -23,7 +23,12 @@ last_time=$start
 
 while read -r path; do
   : $((file_num++))
-  git --no-pager log -1 --format="%ct $path" "$path"
+
+  # git --no-pager log -1 --format="%ct $path" "$path"
+
+  # git log --follow: follow renames of files, which can give a different result
+  git --no-pager log -1 --follow --format="%ct $path" "$path"
+
   ((file_num % dn > 0)) && continue
   now=$(date +%s)
   dt=$((now - last_time))
