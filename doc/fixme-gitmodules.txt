@@ -1,0 +1,5 @@
+git-file-times should also return file times for gitmodules of the repo
+
+but not recursive = not for files in gitmodules or gitmodules
+recursion should be controlled by CLI parameters
+similar to the CLI parameters used by git commands
