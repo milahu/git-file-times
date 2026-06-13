@@ -24,6 +24,8 @@ struct Context {
     // stats
     size_t commits = 0;
     size_t files_found = 0;
+    size_t last_commits = 0;
+    size_t last_files_found = 0;
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point last_print_time;
 };
@@ -163,9 +165,12 @@ void print_stats(Context &ctx)
     size_t remaining = ctx.remaining.size();
     size_t total = ctx.files_found + remaining;
 
-    double commits_per_sec = ctx.commits / (elapsed + 1e-9);
-    double files_per_sec = ctx.files_found / (elapsed + 1e-9);
+    double commits_per_sec = (ctx.commits - ctx.last_commits) / since_last;
+    double files_per_sec = (ctx.files_found - ctx.last_files_found) / since_last;
     double progress = total ? (1.0 * ctx.files_found / total) : 0.0;
+
+    ctx.last_commits = ctx.commits;
+    ctx.last_files_found = ctx.files_found;
 
     double eta = (1 - progress) * total / files_per_sec;
 
