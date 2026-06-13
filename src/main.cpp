@@ -260,6 +260,13 @@ int main() {
             nullptr,
             ctx.get()
         );
+
+        // free memory
+        git_diff_free(diff);
+        if (parent_tree)
+            git_tree_free(parent_tree);
+        git_tree_free(tree);
+        git_commit_free(commit);
     }
 
     git_revwalk_free(walk);
