@@ -1,0 +1,16 @@
+nixpkgs $ git-file-times-slow-verbose.sh >/dev/null
+stats: files=100 time=37 files/s=2.702 avg_files/s=2.702
+stats: files=200 time=152 files/s=0.869 avg_files/s=1.315
+stats: files=300 time=206 files/s=1.851 avg_files/s=1.456
+stats: files=400 time=302 files/s=1.041 avg_files/s=1.324
+stats: files=500 time=660 files/s=0.279 avg_files/s=0.757
+stats: files=600 time=763 files/s=0.970 avg_files/s=0.786
+stats: files=700 time=953 files/s=0.526 avg_files/s=0.734
+stats: files=800 time=1131 files/s=0.561 avg_files/s=0.707
+stats: files=900 time=1199 files/s=1.470 avg_files/s=0.750
+stats: files=1000 time=1323 files/s=0.806 avg_files/s=0.755
+stats: files=1100 time=1425 files/s=0.980 avg_files/s=0.771
+stats: files=1200 time=1566 files/s=0.709 avg_files/s=0.766
+stats: files=1300 time=1659 files/s=1.075 avg_files/s=0.783
+stats: files=1400 time=1740 files/s=1.234 avg_files/s=0.804
+stats: files=1500 time=1827 files/s=1.149 avg_files/s=0.821
