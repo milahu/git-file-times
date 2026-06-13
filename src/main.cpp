@@ -77,6 +77,18 @@ static int diff_cb(
 {
     auto *ctx = static_cast<Context *>(payload);
 
+    const char *new_path = delta->new_file.path;
+
+    if (
+        !new_path ||
+        // path is not part of the HEAD tree
+        !ctx->remaining.count(new_path) ||
+        // path has been processed
+        ctx->seen.count(new_path)
+    ) {
+        return 0;
+    }
+
     const git_diff_file *f = (
         delta->new_file.path ? &delta->new_file
         : &delta->old_file
@@ -136,16 +148,9 @@ static int diff_cb(
     if (delta->status == GIT_DELTA_RENAMED)
         return 0;
 
-    if (
-        // path is part of the HEAD tree
-        ctx->remaining.count(path) &&
-        // path has not been processed
-        !ctx->seen.count(path)
-    ) {
-        ctx->seen[path] = ctx->time;
-        ctx->remaining.erase(path);
-        ctx->files_found++;
-    }
+    ctx->seen[path] = ctx->time;
+    ctx->remaining.erase(path);
+    ctx->files_found++;
 
     return 0;
 }
