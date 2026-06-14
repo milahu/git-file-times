@@ -114,6 +114,42 @@ static void compare_tree(
     git_tree *current,
     Context *ctx)
 {
+    if (!parent) {
+        // current commit is root commit
+        // all files were added in current commit
+        git_tree_walk(
+            current,
+            GIT_TREEWALK_PRE,
+            [](const char *root,
+            const git_tree_entry *entry,
+            void *payload) -> int
+            {
+                auto *ctx =
+                    static_cast<Context*>(payload);
+
+                if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
+                    return 0;
+
+                const git_oid *oid = git_tree_entry_id(entry);
+                if (!oid)
+                    return 0;
+
+                // entry was added in current commit
+                auto it = ctx->blobs.find(*oid);
+                if (it != ctx->blobs.end()) {
+                    it->second.time = ctx->time;
+                    it->second.has_time = true;
+                    ctx->num_remaining--;
+                    ctx->files_found++;
+                }
+
+                return 0;
+            },
+            ctx
+        );
+        return;
+    }
+
     // parent and current entry index
     size_t p = 0;
     size_t c = 0;
