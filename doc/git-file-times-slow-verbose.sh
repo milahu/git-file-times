@@ -26,8 +26,10 @@ while read -r path; do
 
   # git --no-pager log -1 --format="%ct $path" "$path"
 
-  # git log --follow: follow renames of files, which can give a different result
-  git --no-pager log -1 --follow --format="%ct $path" "$path"
+  # git log --follow --diff-filter=AM: do not count file renames as file modifications
+  # A = file was added
+  # M = file was modified
+  git --no-pager log --follow --diff-filter=AM -1 --follow --format="%ct $path" "$path"
 
   ((file_num % dn > 0)) && continue
   now=$(date +%s)

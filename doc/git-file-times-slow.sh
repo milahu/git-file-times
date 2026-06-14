@@ -5,5 +5,7 @@
 
 # git ls-files -z | xargs -0 -I{} -- git log -1 --format="%ct {}" {}
 
-# git log --follow: follow renames of files, which can give a different result
-git ls-files -z | xargs -0 -I{} -- git log -1 --follow --format="%ct {}" {}
+# git log --follow --diff-filter=AM: do not count file renames as file modifications
+# A = file was added
+# M = file was modified
+git ls-files -z | xargs -0 -I{} -- git log --follow --diff-filter=AM -1 --format="%ct {}" {}
