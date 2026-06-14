@@ -2,6 +2,7 @@
 #define PRINT_STATS_EVERY_N_COMMITS 1000 // ~ every 100 seconds
 
 #define DEBUG false
+// #define DEBUG true
 
 #include <git2.h>
 #include <unordered_map>
@@ -50,6 +51,7 @@ struct Context {
     git_oid *oid;
     git_commit *commit;
     git_repository *repo;
+    std::string tree_root;
     // stats
     size_t commits = 0;
     size_t files_found = 0;
@@ -110,11 +112,62 @@ static BlobStateMap collect_head_blobs(git_repository *repo)
     return blobs;
 }
 
+std::string join_paths_3(std::string a, std::string b, std::string c) {
+    std::string result;
+    const bool debug = false;
+    // const bool debug = true;
+    if (a.size()) {
+        // starts_with requires C++20
+        if (a.starts_with("/")) {
+            if (debug)
+                result += " a=" + a.substr(1);
+            else
+                result += a.substr(1);
+        }
+        else {
+            if (debug)
+                result += "a=" + a;
+            else
+                result += a;
+        }
+    }
+    if (b.size()) {
+        // ends_with requires C++20
+        if (result.size() && !result.ends_with("/")) {
+            result += "/";
+        }
+        if (b.starts_with("/")) {
+            if (debug)
+                result += " b=" + b.substr(1);
+            else
+                result += b.substr(1);
+        }
+        else {
+            if (debug)
+                result += " b=" + b;
+            else
+                result += b;
+        }
+    }
+    assert(c.size());
+    if (result.size() && !result.ends_with("/")) {
+        result += "/";
+    }
+    if (debug)
+        result += " c=" + c;
+    else
+        result += c;
+    return result;
+}
+
 static void compare_tree(
     git_tree *parent,
     git_tree *current,
+    std::string parent_root,
+    std::string current_root,
     Context *ctx)
 {
+    ctx->tree_root = current_root;
     if (!parent) {
         // current commit is root commit
         // all files were added in current commit
@@ -138,10 +191,25 @@ static void compare_tree(
                 // entry was added in current commit
                 auto it = ctx->blobs.find(*oid);
                 if (it != ctx->blobs.end()) {
-                    it->second.time = ctx->time;
-                    it->second.has_time = true;
-                    ctx->num_remaining--;
-                    ctx->files_found++;
+                    std::string path = join_paths_3(ctx->tree_root, root, git_tree_entry_name(entry));
+                    if (!it->second.has_time) {
+                        if (DEBUG)
+                            std::cerr << "190: setting time: path=" << path
+                                << " time=" << ctx->time
+                                << " commit=" << git_oid_tostr_s(ctx->oid)
+                                << "\n";
+                        it->second.time = ctx->time;
+                        it->second.has_time = true;
+                        ctx->num_remaining--;
+                        ctx->files_found++;
+                    }
+                    else {
+                        if (DEBUG)
+                            std::cerr << "190: not setting time: path=" << path
+                                << " time=" << ctx->time
+                                << " commit=" << git_oid_tostr_s(ctx->oid)
+                                << "\n";
+                    }
                 }
 
                 return 0;
@@ -211,10 +279,26 @@ static void compare_tree(
                     // blob changed in this commit
                     auto it = ctx->blobs.find(*coid);
                     if (it != ctx->blobs.end()) {
-                        it->second.time = ctx->time;
-                        it->second.has_time = true;
-                        ctx->num_remaining--;
-                        ctx->files_found++;
+                        // std::string path = join_paths_3(ctx->tree_root, current_root, git_tree_entry_name(ce));
+                        std::string path = join_paths_3(ctx->tree_root, "", git_tree_entry_name(ce));
+                        if (!it->second.has_time) {
+                            if (DEBUG)
+                                std::cerr << "270: setting time: path=" << path
+                                    << " time=" << ctx->time
+                                    << " commit=" << git_oid_tostr_s(ctx->oid)
+                                    << "\n";
+                            it->second.time = ctx->time;
+                            it->second.has_time = true;
+                            ctx->num_remaining--;
+                            ctx->files_found++;
+                        }
+                        else {
+                            if (DEBUG)
+                                std::cerr << "270: not setting time: path=" << path
+                                    << " time=" << ctx->time
+                                    << " commit=" << git_oid_tostr_s(ctx->oid)
+                                    << "\n";
+                        }
                     }
                 }
             }
@@ -228,8 +312,11 @@ static void compare_tree(
                     git_tree *ctree = nullptr;
                     git_tree_lookup(&ptree, ctx->repo, poid);
                     git_tree_lookup(&ctree, ctx->repo, coid);
+                    // FIXME avoid recursion
                     // recursion
-                    compare_tree(ptree, ctree, ctx);
+                    std::string proot = parent_root + "/" + git_tree_entry_name(pe);
+                    std::string croot = parent_root + "/" + git_tree_entry_name(ce);
+                    compare_tree(ptree, ctree, proot, croot, ctx);
                     // free memory
                     git_tree_free(ptree);
                     git_tree_free(ctree);
@@ -258,19 +345,38 @@ static void compare_tree(
                 const git_oid *coid = git_tree_entry_id(ce);
                 auto it = ctx->blobs.find(*coid);
                 if (it != ctx->blobs.end()) {
-                    it->second.time = ctx->time;
-                    it->second.has_time = true;
-                    ctx->num_remaining--;
-                    ctx->files_found++;
+                    // std::string path = join_paths_3(ctx->tree_root, current_root, git_tree_entry_name(ce));
+                    std::string path = join_paths_3(ctx->tree_root, "", git_tree_entry_name(ce));
+                    if (!it->second.has_time) {
+                        if (DEBUG)
+                            std::cerr << "330: setting time: path=" << path
+                                << " time=" << ctx->time
+                                << " commit=" << git_oid_tostr_s(ctx->oid)
+                                << "\n";
+                        it->second.time = ctx->time;
+                        it->second.has_time = true;
+                        ctx->num_remaining--;
+                        ctx->files_found++;
+                    }
+                    else {
+                        if (DEBUG)
+                            std::cerr << "330: not setting time: path=" << path
+                                << " time=" << ctx->time
+                                << " commit=" << git_oid_tostr_s(ctx->oid)
+                                << "\n";
+                    }
                 }
             }
-            else if (ctype == GIT_OBJECT_TREE)
+            // TODO remove
+            // else if (ctype == GIT_OBJECT_TREE)
+            else if (false)
             {
                 // tree was added in current commit
                 const git_oid *coid = git_tree_entry_id(ce);
                 git_tree *ctree = nullptr;
                 git_tree_lookup(&ctree, ctx->repo, coid);
                 assert(ctree != nullptr);
+                ctx->tree_root = join_paths_3(current_root, "", git_tree_entry_name(ce));
                 git_tree_walk(
                     ctree,
                     GIT_TREEWALK_PRE,
@@ -291,16 +397,45 @@ static void compare_tree(
                         // entry was added in current commit
                         auto it = ctx->blobs.find(*oid);
                         if (it != ctx->blobs.end()) {
-                            it->second.time = ctx->time;
-                            it->second.has_time = true;
-                            ctx->num_remaining--;
-                            ctx->files_found++;
+                            std::string path = join_paths_3(ctx->tree_root, root, git_tree_entry_name(entry));
+                            if (!it->second.has_time) {
+                                if (DEBUG)
+                                    std::cerr << "370: setting time: path=" << path
+                                        << " time=" << ctx->time
+                                        << " commit=" << git_oid_tostr_s(ctx->oid)
+                                        << "\n";
+                                it->second.time = ctx->time;
+                                it->second.has_time = true;
+                                ctx->num_remaining--;
+                                ctx->files_found++;
+                            }
+                            else {
+                                if (DEBUG)
+                                    std::cerr << "370: not setting time: path=" << path
+                                        << " time=" << ctx->time
+                                        << " commit=" << git_oid_tostr_s(ctx->oid)
+                                        << "\n";
+                            }
                         }
 
                         return 0;
                     },
                     ctx
                 );
+                ctx->tree_root = current_root;
+            }
+            else if (ctype == GIT_OBJECT_TREE)
+            {
+                // compare tree contents
+                const git_oid *coid = git_tree_entry_id(ce);
+                git_tree *ctree = nullptr;
+                git_tree_lookup(&ctree, ctx->repo, coid);
+                // FIXME avoid recursion
+                // recursion
+                std::string croot = parent_root + "/" + git_tree_entry_name(ce);
+                compare_tree(nullptr, ctree, "", croot, ctx);
+                // free memory
+                git_tree_free(ctree);
             }
             ++c;
         }
@@ -423,7 +558,7 @@ int main() {
         git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
         opts.flags |= GIT_DIFF_INCLUDE_UNTRACKED;
 
-        compare_tree(parent_tree, tree, ctx.get());
+        compare_tree(parent_tree, tree, "", "", ctx.get());
 
         // free memory
         if (parent_tree)
