@@ -4,7 +4,6 @@
 #define DEBUG false
 // #define DEBUG true
 
-#include <git2.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -15,6 +14,12 @@
 #include <atomic>
 #include <cstring>
 #include <cassert>
+
+// NOTE this requires a patched version of libgit2
+// in src/vendor/libgit2
+// https://github.com/libgit2/libgit2/pull/7296
+// export all internal git functions
+#include <git2.h>
 
 struct OidHash {
     size_t operator()(const git_oid& oid) const noexcept {
@@ -160,286 +165,110 @@ std::string join_paths_3(std::string a, std::string b, std::string c) {
     return result;
 }
 
-static void compare_tree(
-    git_tree *parent,
-    git_tree *current,
-    std::string parent_root,
-    std::string current_root,
-    Context *ctx)
+void compare_tree(
+    git_tree* old_tree,
+    git_tree* new_tree,
+    Context* ctx)
 {
-    ctx->tree_root = current_root;
-    if (!parent) {
-        // current commit is root commit
-        // all files were added in current commit
-        git_tree_walk(
-            current,
-            GIT_TREEWALK_PRE,
-            [](const char *root,
-            const git_tree_entry *entry,
-            void *payload) -> int
-            {
-                auto *ctx =
-                    static_cast<Context*>(payload);
+    assert(new_tree);
 
-                if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
-                    return 0;
+    // if (!old_tree) std::cerr << "old_tree is null\n";
 
-                const git_oid *oid = git_tree_entry_id(entry);
-                if (!oid)
-                    return 0;
+    git_iterator* old_it = nullptr;
+    git_iterator* new_it = nullptr;
 
-                // entry was added in current commit
-                auto it = ctx->blobs.find(*oid);
-                if (it != ctx->blobs.end()) {
-                    std::string path = join_paths_3(ctx->tree_root, root, git_tree_entry_name(entry));
-                    if (!it->second.has_time) {
-                        if (DEBUG)
-                            std::cerr << "190: setting time: path=" << path
-                                << " time=" << ctx->time
-                                << " commit=" << git_oid_tostr_s(ctx->oid)
-                                << "\n";
-                        it->second.time = ctx->time;
-                        it->second.has_time = true;
-                        ctx->num_remaining--;
-                        ctx->files_found++;
-                    }
-                    else {
-                        if (DEBUG)
-                            std::cerr << "190: not setting time: path=" << path
-                                << " time=" << ctx->time
-                                << " commit=" << git_oid_tostr_s(ctx->oid)
-                                << "\n";
-                    }
-                }
+    git_iterator_options iter_opts = GIT_ITERATOR_OPTIONS_INIT;
 
-                return 0;
-            },
-            ctx
-        );
+    int err;
+
+    err = git_iterator_for_tree(&old_it, old_tree, &iter_opts);
+    if (err < 0) {
+        const git_error *e = git_error_last();
+        std::cerr << "error: failed to get iterator for old_tree: "
+                << (e ? e->message : "unknown")
+                << "\n";
         return;
     }
 
-    // parent and current entry index
-    size_t p = 0;
-    size_t c = 0;
+    err = git_iterator_for_tree(&new_it, new_tree, &iter_opts);
+    if (err < 0) {
+        const git_error *e = git_error_last();
+        std::cerr << "error: failed to get iterator for new_tree: "
+                << (e ? e->message : "unknown")
+                << "\n";
+        return;
+    }
 
-    // parent and current tree size
-    const size_t parent_n = parent ? git_tree_entrycount(parent) : 0;
-    const size_t current_n = current ? git_tree_entrycount(current) : 0;
+    const git_index_entry* old_e = nullptr;
+    const git_index_entry* new_e = nullptr;
 
-    // loop entries of parent and current tree in parallel
-    // exploit the fact that tree entries are sorted by name
-    while (p < parent_n || c < current_n) {
+    git_iterator_current(&old_e, old_it);
+    git_iterator_current(&new_e, new_it);
 
-        // parent and current entry
-        const git_tree_entry *pe = (
-            (p < parent_n) ? git_tree_entry_byindex(parent, p)
-            : nullptr
-        );
-        const git_tree_entry *ce = (
-            (c < current_n) ? git_tree_entry_byindex(current, c)
-            : nullptr
-        );
+    while (old_e || new_e) {
 
         int cmp;
-        if (!pe) {
-            // end of parent tree
-            cmp = +1;
+
+        if (!old_e)
+            cmp = 1;
+        else if (!new_e)
+            cmp = -1;
+        else
+            cmp = strcmp(old_e->path, new_e->path);
+
+        if (cmp < 0) {
+            // path existed in parent
+            // but disappeared in current
+            git_iterator_advance(&old_e, old_it);
         }
-        else if (!ce) {
-            // end of current tree
-            // cmp = -1;
-            break;
+        else if (cmp > 0) {
+            // path added in current
+            // handle_addition(new_e, ctx);
+            // const git_oid *oid = &new_e->oid;
+            const git_oid *oid = &new_e->id;
+            auto it = ctx->blobs.find(*oid);
+            if (it != ctx->blobs.end()) {
+                auto &info = it->second;
+                if (!info.has_time) {
+                    info.time = ctx->time;
+                    info.has_time = true;
+                    ctx->files_found++;
+                }
+            }
+            git_iterator_advance(&new_e, new_it);
         }
         else {
-            // found parent and current entry
-            // compare entry names
-            cmp = strcmp(
-                git_tree_entry_name(pe),
-                git_tree_entry_name(ce)
-            );
-            // note: git_tree_entry_name does not return
-            // slash-suffixed names for tree entries
-            // std::cerr << "p_name=" << git_tree_entry_name(pe) << "\n";
-            // std::cerr << "c_name=" << git_tree_entry_name(ce) << "\n";
-        }
+            const git_oid *old_oid = &old_e->id;
+            const git_oid *new_oid = &new_e->id;
+            // const git_oid *old_oid = git_tree_entry_id(old_e);
+            // const git_oid *new_oid = git_tree_entry_id(new_e);
 
-        if (cmp == 0) {
-            // same entry name in parent and current tree
-            // std::cerr << "same entry name: " << git_tree_entry_name(pe) << "\n";
-            // compare entry contents
-            auto ptype = git_tree_entry_type(pe);
-            auto ctype = git_tree_entry_type(ce);
-            if (ptype == GIT_OBJECT_BLOB && ctype == GIT_OBJECT_BLOB)
-            {
-                // compare blob contents
-                const git_oid *poid = git_tree_entry_id(pe);
-                const git_oid *coid = git_tree_entry_id(ce);
-                if (!git_oid_equal(poid, coid)) {
-                    // blob changed in this commit
-                    auto it = ctx->blobs.find(*coid);
-                    if (it != ctx->blobs.end()) {
-                        // std::string path = join_paths_3(ctx->tree_root, current_root, git_tree_entry_name(ce));
-                        std::string path = join_paths_3(ctx->tree_root, "", git_tree_entry_name(ce));
-                        if (!it->second.has_time) {
-                            if (DEBUG)
-                                std::cerr << "270: setting time: path=" << path
-                                    << " time=" << ctx->time
-                                    << " commit=" << git_oid_tostr_s(ctx->oid)
-                                    << "\n";
-                            it->second.time = ctx->time;
-                            it->second.has_time = true;
-                            ctx->num_remaining--;
-                            ctx->files_found++;
-                        }
-                        else {
-                            if (DEBUG)
-                                std::cerr << "270: not setting time: path=" << path
-                                    << " time=" << ctx->time
-                                    << " commit=" << git_oid_tostr_s(ctx->oid)
-                                    << "\n";
-                        }
-                    }
-                }
-            }
-            else if (ptype == GIT_OBJECT_TREE && ctype == GIT_OBJECT_TREE)
-            {
-                // compare tree contents
-                const git_oid *poid = git_tree_entry_id(pe);
-                const git_oid *coid = git_tree_entry_id(ce);
-                if (!git_oid_equal(poid, coid)) {
-                    git_tree *ptree = nullptr;
-                    git_tree *ctree = nullptr;
-                    git_tree_lookup(&ptree, ctx->repo, poid);
-                    git_tree_lookup(&ctree, ctx->repo, coid);
-                    // FIXME avoid recursion
-                    // recursion
-                    std::string proot = parent_root + "/" + git_tree_entry_name(pe);
-                    std::string croot = parent_root + "/" + git_tree_entry_name(ce);
-                    compare_tree(ptree, ctree, proot, croot, ctx);
-                    // free memory
-                    git_tree_free(ptree);
-                    git_tree_free(ctree);
-                }
-            }
-            // else: file type was changed. TODO what now?
-            ++p;
-            ++c;
-        }
-        else if (cmp == -1) {
-            // entry name exists only in parent tree
-            // std::cerr << "entry name only in parent tree: " << git_tree_entry_name(pe) << "\n";
-            // entry was removed in current commit
-            // FIXME maybe entry was renamed
-            ++p;
-        }
-        else { // cmp == +1
-            // entry name exists only in current tree
-            // std::cerr << "entry name only in current tree: " << git_tree_entry_name(ce) << "\n";
-            // entry was added in current commit
-            // FIXME maybe entry was renamed
-            auto ctype = git_tree_entry_type(ce);
-            if (ctype == GIT_OBJECT_BLOB)
-            {
-                // blob was added in current commit
-                const git_oid *coid = git_tree_entry_id(ce);
-                auto it = ctx->blobs.find(*coid);
+            // if blob changed, mark new blob as "born here"
+            // if (git_oid_cmp(&old_e->id, &new_e->id) != 0) {
+            if (!git_oid_equal(old_oid, new_oid)) {
+                // same path exists in both trees
+                // handle_modification(old_e, new_e, ctx);
+
+                auto it = ctx->blobs.find(*new_oid);
                 if (it != ctx->blobs.end()) {
-                    // std::string path = join_paths_3(ctx->tree_root, current_root, git_tree_entry_name(ce));
-                    std::string path = join_paths_3(ctx->tree_root, "", git_tree_entry_name(ce));
-                    if (!it->second.has_time) {
-                        if (DEBUG)
-                            std::cerr << "330: setting time: path=" << path
-                                << " time=" << ctx->time
-                                << " commit=" << git_oid_tostr_s(ctx->oid)
-                                << "\n";
-                        it->second.time = ctx->time;
-                        it->second.has_time = true;
-                        ctx->num_remaining--;
+
+                    auto &info = it->second;
+
+                    if (!info.has_time) {
+                        info.time = ctx->time;
+                        info.has_time = true;
                         ctx->files_found++;
                     }
-                    else {
-                        if (DEBUG)
-                            std::cerr << "330: not setting time: path=" << path
-                                << " time=" << ctx->time
-                                << " commit=" << git_oid_tostr_s(ctx->oid)
-                                << "\n";
-                    }
                 }
             }
-            // TODO remove
-            // else if (ctype == GIT_OBJECT_TREE)
-            else if (false)
-            {
-                // tree was added in current commit
-                const git_oid *coid = git_tree_entry_id(ce);
-                git_tree *ctree = nullptr;
-                git_tree_lookup(&ctree, ctx->repo, coid);
-                assert(ctree != nullptr);
-                ctx->tree_root = join_paths_3(current_root, "", git_tree_entry_name(ce));
-                git_tree_walk(
-                    ctree,
-                    GIT_TREEWALK_PRE,
-                    [](const char *root,
-                    const git_tree_entry *entry,
-                    void *payload) -> int
-                    {
-                        auto *ctx =
-                            static_cast<Context*>(payload);
 
-                        if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
-                            return 0;
-
-                        const git_oid *oid = git_tree_entry_id(entry);
-                        if (!oid)
-                            return 0;
-
-                        // entry was added in current commit
-                        auto it = ctx->blobs.find(*oid);
-                        if (it != ctx->blobs.end()) {
-                            std::string path = join_paths_3(ctx->tree_root, root, git_tree_entry_name(entry));
-                            if (!it->second.has_time) {
-                                if (DEBUG)
-                                    std::cerr << "370: setting time: path=" << path
-                                        << " time=" << ctx->time
-                                        << " commit=" << git_oid_tostr_s(ctx->oid)
-                                        << "\n";
-                                it->second.time = ctx->time;
-                                it->second.has_time = true;
-                                ctx->num_remaining--;
-                                ctx->files_found++;
-                            }
-                            else {
-                                if (DEBUG)
-                                    std::cerr << "370: not setting time: path=" << path
-                                        << " time=" << ctx->time
-                                        << " commit=" << git_oid_tostr_s(ctx->oid)
-                                        << "\n";
-                            }
-                        }
-
-                        return 0;
-                    },
-                    ctx
-                );
-                ctx->tree_root = current_root;
-            }
-            else if (ctype == GIT_OBJECT_TREE)
-            {
-                // compare tree contents
-                const git_oid *coid = git_tree_entry_id(ce);
-                git_tree *ctree = nullptr;
-                git_tree_lookup(&ctree, ctx->repo, coid);
-                // FIXME avoid recursion
-                // recursion
-                std::string croot = parent_root + "/" + git_tree_entry_name(ce);
-                compare_tree(nullptr, ctree, "", croot, ctx);
-                // free memory
-                git_tree_free(ctree);
-            }
-            ++c;
+            git_iterator_advance(&old_e, old_it);
+            git_iterator_advance(&new_e, new_it);
         }
     }
+
+    git_iterator_free(old_it);
+    git_iterator_free(new_it);
 }
 
 void print_stats(Context &ctx)
@@ -558,7 +387,7 @@ int main() {
         git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
         opts.flags |= GIT_DIFF_INCLUDE_UNTRACKED;
 
-        compare_tree(parent_tree, tree, "", "", ctx.get());
+        compare_tree(parent_tree, tree, ctx.get());
 
         // free memory
         if (parent_tree)
