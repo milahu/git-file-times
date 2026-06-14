@@ -1,0 +1,3 @@
+[submodule "src/vendor/libgit2"]
+	path = src/vendor/libgit2
+	url = https://github.com/libgit2/libgit2
