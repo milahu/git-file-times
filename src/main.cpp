@@ -13,6 +13,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <cassert>
 
 struct OidHash {
     size_t operator()(const git_oid& oid) const noexcept {
@@ -197,6 +198,7 @@ static void compare_tree(
 
         if (cmp == 0) {
             // same entry name in parent and current tree
+            // std::cerr << "same entry name: " << git_tree_entry_name(pe) << "\n";
             // compare entry contents
             auto ptype = git_tree_entry_type(pe);
             auto ctype = git_tree_entry_type(ce);
@@ -239,16 +241,20 @@ static void compare_tree(
         }
         else if (cmp == -1) {
             // entry name exists only in parent tree
+            // std::cerr << "entry name only in parent tree: " << git_tree_entry_name(pe) << "\n";
             // entry was removed in current commit
             // FIXME maybe entry was renamed
             ++p;
         }
         else { // cmp == +1
             // entry name exists only in current tree
+            // std::cerr << "entry name only in current tree: " << git_tree_entry_name(ce) << "\n";
             // entry was added in current commit
             // FIXME maybe entry was renamed
-            if (ce && git_tree_entry_type(ce) == GIT_OBJECT_BLOB)
+            auto ctype = git_tree_entry_type(ce);
+            if (ctype == GIT_OBJECT_BLOB)
             {
+                // blob was added in current commit
                 const git_oid *coid = git_tree_entry_id(ce);
                 auto it = ctx->blobs.find(*coid);
                 if (it != ctx->blobs.end()) {
@@ -257,6 +263,44 @@ static void compare_tree(
                     ctx->num_remaining--;
                     ctx->files_found++;
                 }
+            }
+            else if (ctype == GIT_OBJECT_TREE)
+            {
+                // tree was added in current commit
+                const git_oid *coid = git_tree_entry_id(ce);
+                git_tree *ctree = nullptr;
+                git_tree_lookup(&ctree, ctx->repo, coid);
+                assert(ctree != nullptr);
+                git_tree_walk(
+                    ctree,
+                    GIT_TREEWALK_PRE,
+                    [](const char *root,
+                    const git_tree_entry *entry,
+                    void *payload) -> int
+                    {
+                        auto *ctx =
+                            static_cast<Context*>(payload);
+
+                        if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
+                            return 0;
+
+                        const git_oid *oid = git_tree_entry_id(entry);
+                        if (!oid)
+                            return 0;
+
+                        // entry was added in current commit
+                        auto it = ctx->blobs.find(*oid);
+                        if (it != ctx->blobs.end()) {
+                            it->second.time = ctx->time;
+                            it->second.has_time = true;
+                            ctx->num_remaining--;
+                            ctx->files_found++;
+                        }
+
+                        return 0;
+                    },
+                    ctx
+                );
             }
             ++c;
         }
