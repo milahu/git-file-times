@@ -14,8 +14,6 @@
 #include <atomic>
 #include <cstring>
 
-// slow?
-// but all other versions of `struct OidHash` are even slower
 struct OidHash {
     size_t operator()(const git_oid& oid) const noexcept {
         // reduce the 160-bit oid to a 64-bit hash
@@ -26,67 +24,6 @@ struct OidHash {
         return std::hash<uint64_t>{}(v);
     }
 };
-
-// struct OidHash {
-//     size_t operator()(const git_oid& oid) const noexcept
-//     {
-//         size_t h = 0;
-//         for (unsigned char c : oid.id)
-//             h = h * 131 + c;
-//         return h;
-//     }
-// };
-
-// struct OidHash {
-//     size_t operator()(const git_oid& oid) const noexcept
-//     {
-//         const uint64_t* p =
-//             reinterpret_cast<const uint64_t*>(oid.id);
-//         return p[0] ^ p[1] ^ (size_t)oid.id[16];
-//     }
-// };
-
-// struct OidHash {
-//     size_t operator()(const git_oid& oid) const noexcept
-//     {
-//         uint64_t a, b;
-//         uint32_t c;
-//         memcpy(&a, oid.id + 0, 8);
-//         memcpy(&b, oid.id + 8, 8);
-//         memcpy(&c, oid.id + 16, 4);
-//         return a ^ b ^ ((uint64_t)c << 1);
-//     }
-// };
-
-// struct OidHash {
-//     size_t operator()(const git_oid& oid) const noexcept {
-//         // error: ‘git_oid_hash’ was not declared
-//         return git_oid_hash(&oid);
-//     }
-// };
-
-// struct OidHash {
-//     size_t operator()(const git_oid& oid) const noexcept {
-//         size_t h = 0;
-//         for (size_t i = 0; i < sizeof(oid.id); ++i) {
-//             h = h * 131 + oid.id[i];
-//         }
-//         return h;
-//     }
-// };
-
-// // TODO remove, this is too obscure
-// struct OidHash {
-//     size_t operator()(const git_oid& oid) const noexcept {
-//         const uint64_t* p = reinterpret_cast<const uint64_t*>(oid.id);
-//         size_t h = 1469598103934665603ull; // FNV offset basis
-//         h ^= p[0]; h *= 1099511628211ull;
-//         h ^= p[1]; h *= 1099511628211ull;
-//         h ^= *(const uint32_t*)&oid.id[16];
-//         h *= 1099511628211ull;
-//         return h;
-//     }
-// };
 
 struct OidEq {
     bool operator()(const git_oid& a, const git_oid& b) const noexcept {
@@ -290,65 +227,6 @@ static void compare_tree(
     }
 }
 
-// FIXME this is wrong
-// FIXME this is 20 times slower than compare_tree
-// maybe `ctx->blobs.find(*oid)` is slow
-// because hashing the oid is slow?
-void process_tree_blob_presence(
-    git_tree *tree,
-    Context *ctx
-) {
-    git_tree_walk(
-        tree,
-        GIT_TREEWALK_PRE,
-        [](const char *root,
-           const git_tree_entry *entry,
-           void *payload) -> int
-        {
-            auto *ctx = static_cast<Context*>(payload);
-
-            if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB) {
-                // if (DEBUG) std::cerr << "no blob: " << oid << " " << git_tree_entry_name(entry) << "\n";
-                return 0;
-            }
-
-            const git_oid *oid = git_tree_entry_id(entry);
-
-            auto it = ctx->blobs.find(*oid);
-            if (it == ctx->blobs.end()) {
-                // if (DEBUG) std::cerr << "wrong blob: " << git_oid_tostr_s(oid) << " " << git_tree_entry_name(entry) << "\n";
-                return 0;
-            }
-
-            // if (DEBUG) std::cerr << "found blob: " << git_oid_tostr_s(oid) << " " << git_tree_entry_name(entry) << "\n";
-
-            auto &info = it->second;
-
-            if (!info.has_time) {
-                info.has_time = true;
-                ctx->files_found++;
-            }
-
-            // FIXME this is wrong
-            // if a file was changed from version A -> B -> A
-            // then we want the time of the second version A
-            // not the time of the first version A
-            // so actually, we need to find the first commit where this blob disappears
-            // (version B)
-            // but then we get bad results due to merge commits...
-            // because version A can disappear only temporarily
-            // and re-appear in older commits...
-            // so we still need to resolve filepaths (?)
-
-            // always update time
-            info.time = ctx->time;
-
-            return 0;
-        },
-        ctx
-    );
-}
-
 void print_stats(Context &ctx)
 {
     using namespace std::chrono;
@@ -450,12 +328,12 @@ int main() {
 
         git_tree *parent_tree = nullptr; // first parent
 
-        // if (git_commit_parentcount(commit) > 0) { // ?
-        //     git_commit *parent;
-        //     git_commit_parent(&parent, commit, 0);
-        //     git_commit_tree(&parent_tree, parent);
-        //     git_commit_free(parent);
-        // }
+        if (git_commit_parentcount(commit) > 0) { // ?
+            git_commit *parent;
+            git_commit_parent(&parent, commit, 0);
+            git_commit_tree(&parent_tree, parent);
+            git_commit_free(parent);
+        }
 
         ctx->time = git_commit_time(commit);
         ctx->oid = &oid;
@@ -465,10 +343,7 @@ int main() {
         git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
         opts.flags |= GIT_DIFF_INCLUDE_UNTRACKED;
 
-        // compare_tree(parent_tree, tree, ctx.get());
-
-        // FIXME this is wrong
-        process_tree_blob_presence(tree, ctx.get());
+        compare_tree(parent_tree, tree, ctx.get());
 
         // free memory
         if (parent_tree)
