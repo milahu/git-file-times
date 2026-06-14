@@ -2,5 +2,6 @@ add a CLI option --follow to enable following renames of files
 similar to "git log --follow"
 
 following renames of files is more expensive
-because we have no stop condition
-so we have to trace all commits back to the root commit
+because the stop condition changes
+from "file was renamed"
+to "file was modified"
