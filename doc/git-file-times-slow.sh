@@ -7,5 +7,6 @@
 
 # git log --follow --diff-filter=AM: do not count file renames as file modifications
 # A = file was added
+# C = file was copied
 # M = file was modified
-git ls-files -z | xargs -0 -I{} -- git log --follow --diff-filter=AM -1 --format="%ct {}" {}
+git ls-files -z | xargs -0 -I{} -- git log --follow --diff-filter=ACM -1 --format="%ct {}" {}
