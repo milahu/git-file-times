@@ -1,6 +1,6 @@
 // how often to call print_stats
-// #define PRINT_STATS_EVERY_N_COMMITS 10000
-#define PRINT_STATS_EVERY_N_COMMITS 1000
+#define PRINT_STATS_EVERY_N_COMMITS 10000
+// #define PRINT_STATS_EVERY_N_COMMITS 1000
 // #define PRINT_STATS_EVERY_N_COMMITS 100
 // #define PRINT_STATS_EVERY_N_COMMITS 10
 
@@ -20,6 +20,8 @@
 #include <malloc.h>
 
 #include <git2.h>
+
+#include "nadeausoftware_rss.h"
 
 struct OidHash {
     size_t operator()(const git_oid& oid) const noexcept {
@@ -69,6 +71,8 @@ struct Context {
     std::string tree_root;
     bool is_merge = false;
     std::vector<git_tree*> parent_trees;
+    std::vector<git_oid> added_blobs;
+    std::vector<git_oid> deleted_blobs;
     // stats
     size_t commits = 0;
     size_t files_found = 0;
@@ -208,6 +212,10 @@ static bool tree_contains_blob_at_path(
     return found;
 }
 
+
+
+
+
 void print_stats(Context &ctx)
 {
     using namespace std::chrono;
@@ -245,7 +253,9 @@ void print_stats(Context &ctx)
         << " deltas/s=" << deltas_per_sec
         << " progress=" << (progress * 100.0) << "%"
         // debug OOM
-        << " uordblks=" << mallinfo2().uordblks
+        // << " uordblks=" << mallinfo2().uordblks
+        // << " rss=" << (getCurrentRSS() / 1024.0 / 1024.0) << "MiB"
+        << " rss=" << (getCurrentRSS() / 1024 / 1024) << "MiB"
         << "\n";
     // // debug memleak
     // std::cerr << "  trees:"
@@ -308,6 +318,145 @@ static const git_tree_entry *get_entry(
         return nullptr;
 
     return git_tree_entry_byindex(tree, idx);
+}
+
+static void emit_add_blob(
+    const git_oid *oid,
+    Context *ctx)
+{
+    ctx->added_blobs.push_back(*oid);
+}
+
+static void emit_delete_blob(
+    const git_oid *oid,
+    Context *ctx)
+{
+    ctx->deleted_blobs.push_back(*oid);
+}
+
+static void emit_tree_as_adds(
+    git_tree *tree,
+    Context *ctx)
+{
+    std::vector<git_tree*> stack;
+    stack.push_back(tree);
+
+    while (!stack.empty())
+    {
+        git_tree *t = stack.back();
+        stack.pop_back();
+
+        size_t n = git_tree_entrycount(t);
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            const git_tree_entry *e = git_tree_entry_byindex(t, i);
+            git_object_t type = git_tree_entry_type(e);
+            const git_oid *oid = git_tree_entry_id(e);
+
+            if (type == GIT_OBJECT_BLOB)
+            {
+                // emit_delete_blob(oid, ctx);
+                emit_add_blob(oid, ctx);
+            }
+            else if (type == GIT_OBJECT_TREE)
+            {
+                git_tree *subtree = nullptr;
+                git_tree_lookup(&subtree, ctx->repo, oid);
+                stack.push_back(subtree);
+            }
+        }
+
+        if (t != tree)
+            git_tree_free(t);
+    }
+}
+
+static void emit_tree_as_deletes(
+    git_tree *tree,
+    Context *ctx)
+{
+    std::vector<git_tree*> stack;
+    stack.push_back(tree);
+
+    while (!stack.empty())
+    {
+        git_tree *t = stack.back();
+        stack.pop_back();
+
+        size_t n = git_tree_entrycount(t);
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            const git_tree_entry *e = git_tree_entry_byindex(t, i);
+            git_object_t type = git_tree_entry_type(e);
+            const git_oid *oid = git_tree_entry_id(e);
+
+            if (type == GIT_OBJECT_BLOB)
+            {
+                // emit_add_blob(oid, ctx);
+                emit_delete_blob(oid, ctx);
+            }
+            else if (type == GIT_OBJECT_TREE)
+            {
+                git_tree *sub = nullptr;
+                git_tree_lookup(&sub, ctx->repo, oid);
+                stack.push_back(sub);
+            }
+        }
+        if (t != tree)
+            git_tree_free(t);
+    }
+}
+
+void emit_entry_as_add(
+    const git_tree_entry *e,
+    Context *ctx)
+{
+    git_object_t type = git_tree_entry_type(e);
+    const git_oid *oid = git_tree_entry_id(e);
+    if (type == GIT_OBJECT_BLOB)
+    {
+        emit_add_blob(oid, ctx);
+        return;
+    }
+    if (type == GIT_OBJECT_TREE)
+    {
+        git_tree *tree = nullptr;
+        git_tree_lookup(&tree, ctx->repo, oid);
+        size_t n = git_tree_entrycount(tree);
+        for (size_t i = 0; i < n; i++)
+        {
+            auto e = git_tree_entry_byindex(tree, i);
+            emit_entry_as_add(e, ctx);
+        }
+        git_tree_free(tree);
+    }
+}
+
+void emit_entry_as_delete(
+    const git_tree_entry *e,
+    Context *ctx)
+{
+    git_object_t type = git_tree_entry_type(e);
+    const git_oid *oid = git_tree_entry_id(e);
+    if (type == GIT_OBJECT_BLOB)
+    {
+        emit_delete_blob(oid, ctx);
+        return;
+    }
+    if (type == GIT_OBJECT_TREE)
+    {
+        git_tree *tree = nullptr;
+        git_tree_lookup(&tree, ctx->repo, oid);
+        size_t n = git_tree_entrycount(tree);
+        for (size_t i = 0; i < n; i++)
+        {
+            auto e = git_tree_entry_byindex(tree, i);
+            emit_entry_as_delete(e, ctx);
+        }
+        git_tree_free(tree);
+    }
 }
 
 static void compare_tree_nway(
@@ -374,10 +523,7 @@ static void compare_tree_nway(
                     if (cmp < 0)
                     {
                         // entry was deleted from the current tree
-                        // TODO:
-                        // rename tracking:
-                        // deleted blob oid
-                        // deleted path
+                        emit_entry_as_delete(pe, ctx);
                         frame.pidx[pi]++;
                         matches[pi] = nullptr;
                         // continue walking parent tree entries
@@ -402,22 +548,38 @@ static void compare_tree_nway(
 
             // process current entry
 
+            // TODO remove?
             std::string path =
                 frame.root.empty()
                 ? std::string(cname)
                 : frame.root + "/" + cname;
 
+            // match = same name in parent tree
+            // TODO? rename to has_same_name
+            bool match_in_any_parent = false;
+
+            // TODO? rename to explained
+            // identical = same content in parent tree
             bool identical_in_any_parent = false;
-            bool identical_in_all_parents = true;
 
-            // parent trees for the next iteration
+            // identical = same content in parent tree
+            // bool identical_in_all_parents = true;
+            // false for the root commit
+            bool identical_in_all_parents = !frame.parents.empty();
+
+            // parent trees for the next stack iteration
+            // parents that could still explain this subtree
+            // TODO? rename to recurse_parents
             std::vector<git_tree*> next_ptrees;
+            // std::vector<git_tree*> recurse_parents;
+            next_ptrees.reserve(matches.size());
 
-            // TODO why the if condition? why not always do this?
-            if (ctype == GIT_OBJECT_TREE)
-            {
-                next_ptrees.reserve(matches.size());
-            }
+            // pending "delete entry" events
+            // pending "add entry" events
+            // we can emit the actual events
+            // only after we have processed all parent trees
+            std::vector<const git_tree_entry*> deletes;
+            std::vector<const git_tree_entry*> adds;
 
             // find entries with identical contents
             for (size_t pi = 0; pi < matches.size(); ++pi)
@@ -426,124 +588,171 @@ static void compare_tree_nway(
                 if (!pe)
                 {
                     // no parent entry with identical name
+                    // TODO emit add/delete events?
+                    // later?
+                    // if (!match_in_any_parent)
+                    // {
+                    //     emit_entry_as_add(ce, ctx);
+                    // }
                     continue;
                 }
+                match_in_any_parent = true;
                 // parent entry with identical name
                 git_object_t ptype = git_tree_entry_type(pe);
                 if (ptype != ctype)
                 {
                     // type changed
-                    // TODO? emit add/delete events
                     identical_in_all_parents = false;
-                    // for tracking of renames, we need all add/delete events
-                    // so we need to recurse into subtrees
-                    if (ptype == GIT_OBJECT_TREE)
+                    // FIXME defer emitting these events
+                    // we do not want these events if identical_in_any_parent==true
+                    // todo_emit_entry_as_delete.emplace(pe);
+                    // todo_emit_entry_as_add.emplace(ce);
+                    // emit_entry_as_delete(pe, ctx);
+                    // emit_entry_as_add(ce, ctx);
+                    deletes.push_back(pe);
+                    // adds.push_back(ce); // TODO why not?
+                    if (ctype == GIT_OBJECT_TREE)
                     {
-                        // parent tree
-                        const git_oid *poid = git_tree_entry_id(pe);
+                        // TODO what?!
+                        // ptype != ctype
+                        // ctype == GIT_OBJECT_TREE
+                        // ptype == GIT_OBJECT_BLOB
+                        // -> git_tree_lookup makes no sense with pe
                         git_tree *ptree = nullptr;
-                        git_tree_lookup(&ptree, ctx->repo, poid);
-                        // NOTE we do not keep track of parent commits
-                        // because we only care about the current commit
-                        // and whether files changed from parent commits
-                        next_ptrees.push_back(ptree);
+                        git_tree_lookup(&ptree, ctx->repo, git_tree_entry_id(pe));
+                        next_ptrees.push_back(std::move(ptree));
                     }
                     continue;
                 }
+                // ctype == ptype
                 const git_oid *poid = git_tree_entry_id(pe);
                 if (git_oid_equal(poid, coid))
                 {
+                    // this parent explains the entry
                     // parent entry with identical content
                     // entry was copied from the parent tree
+                    // this is the most common case (?)
                     identical_in_any_parent = true;
-                    // no. for tracking of renames, we need all add/delete events
-                    // break;
+
+                    // // no. for tracking of renames, we need all add/delete events
+                    // // break;
+                    // continue;
+
+                    // TODO? only for ctype==GIT_OBJECT_TREE
+                    // this parent explains the current subtree
+                    // discard other pending parents
+                    for (git_tree *t : next_ptrees)
+                        git_tree_free(t);
+                    next_ptrees.clear();
+
+                    // stop comparing entries
+                    // FIXME? but then "identical_in_all_parents" is wrong
+                    break;
                 }
-                else
+                if (ptype == GIT_OBJECT_BLOB)
                 {
-                    // parent entry with different content
+                    // parent blob with different content
+                    // ctype == ptype == GIT_OBJECT_BLOB
+                    // git_oid_equal(poid, coid) == false
+                    // this is the second-most common case (?)
                     identical_in_all_parents = false;
+                    emit_delete_blob(poid, ctx);
+                    emit_add_blob(coid, ctx);
+                    continue;
                 }
-                // if (ctype == GIT_OBJECT_TREE)
-                if (ptype == GIT_OBJECT_TREE)
-                {
-                    // parent tree
-                    git_tree *ptree = nullptr;
-                    git_tree_lookup(&ptree, ctx->repo, poid);
-                    // NOTE we do not keep track of parent commits
-                    // because we only care about the current commit
-                    // and whether files changed from parent commits
-                    next_ptrees.push_back(ptree);
-                }
+                // parent tree with different content
+                // ctype == ptype == GIT_OBJECT_TREE
+                // git_oid_equal(poid, coid) == false
+                identical_in_all_parents = false;
+                // recurse into subtrees to compare their entries
+                git_tree *ptree = nullptr;
+                git_tree_lookup(&ptree, ctx->repo, poid);
+                next_ptrees.push_back(ptree);
             }
 
-            if (identical_in_all_parents)
+            if (!match_in_any_parent) {
+                // entry was not copied from any parent tree
+                // entry was added to the current tree
+                emit_entry_as_add(ce, ctx);
+            }
+
+            // if (identical_in_all_parents)
+            if (identical_in_any_parent)
             {
+                // nothing was changed
+                // the current entry was copied from some parent
                 frame.cidx++;
                 continue;
             }
 
-            if (ctype == GIT_OBJECT_BLOB)
-            {
-                // current blob
-                if (!identical_in_any_parent)
-                {
-                    // blob was added by the current commit
-                    // we found the last-modified time of this file
-                    // TODO add option: dont treat renames as modifications
-                    // tracking renames is non-trivial
-                    // because we have to keep track of all
-                    // "add blob" and "delete blob" events
-                    // and pair these events by blob ID
-                    auto it = ctx->blobs.find(*coid);
-                    if (it != ctx->blobs.end())
-                    {
-                        if (!it->second.has_time)
-                        {
-                            it->second.time = ctx->time;
-                            it->second.has_time = true;
-                            ctx->files_found++;
-                            // output result
-                            // emit the last-modified time as soon as possible
-                            std::cout << it->second.time << " " << it->second.path << "\n";
-                        }
-                    }
-                }
-                // else: blob was copied from some parent commit
+            for (auto *pe : deletes)
+                emit_entry_as_delete(pe, ctx);
 
-                size_t nparents = next_ptrees.size();
-                // TODO what if nparents>0
-                // recurse into subtrees to compare their entries
-            }
-            else if (ctype == GIT_OBJECT_TREE)
+            for (auto *pe : adds)
+                emit_entry_as_add(pe, ctx);
+
+            // WTF?
+            // if (!match_in_any_parent)
+            //     emit_entry_as_add(ce, ctx);
+            // else
+            //     emit_entry_as_add(ce, ctx);
+
+            // no. duplicate
+            // if (ctype == GIT_OBJECT_BLOB)
+            // {
+            //     // current blob
+            //     if (!identical_in_any_parent)
+            //     {
+            //         // blob was added by the current commit
+            //         // TODO modified or added or renamed?
+            //         emit_add_blob(coid, ctx);
+            //     }
+            //     // else: blob was copied from some parent commit
+            // }
+            // else if (ctype == GIT_OBJECT_TREE)
+            // {
+            //     if (!next_ptrees.empty())
+            //     {
+            //         // recurse into subtrees to compare their entries
+            //         git_tree *ctree = nullptr;
+            //         git_tree_lookup(&ctree, ctx->repo, coid);
+            //         size_t nparents = next_ptrees.size();
+            //         // TODO verify: does this work when nparents==0
+            //         stack.push_back({
+            //             ctree,
+            //             std::move(next_ptrees),
+            //             std::vector<size_t>(nparents, 0),
+            //             0,
+            //             path,
+            //             true
+            //         });
+            //     }
+            //     else
+            //     {
+            //         // subtree first appears here
+            //         emit_entry_as_add(ce, ctx);
+            //     }
+            // }
+
+            // size_t nparents = next_ptrees.size();
+            // TODO what if nparents>0
+            // recurse into subtrees to compare their entries
+
+            if (ctype == GIT_OBJECT_TREE && !next_ptrees.empty())
             {
-                // current subtree
-                if (!identical_in_any_parent)
-                {
-                    // subtree was added by the current commit
-                    // recurse into subtrees to compare their entries
-                    git_tree *ctree = nullptr;
-                    git_tree_lookup(&ctree, ctx->repo, coid);
-                    size_t nparents = next_ptrees.size();
-                    // TODO verify: does this work when nparents==0
-                    stack.push_back({
-                        ctree,
-                        std::move(next_ptrees),
-                        std::vector<size_t>(nparents, 0),
-                        0,
-                        path,
-                        true
-                    });
-                }
-                else // identical_in_any_parent == true
-                {
-                    // subtree was copied from some parent commit
-                    for (git_tree *t : next_ptrees)
-                    {
-                        git_tree_free(t);
-                    }
-                }
+                git_tree *ctree = nullptr;
+                git_tree_lookup(&ctree, ctx->repo, coid);
+                size_t nparents = next_ptrees.size();
+                stack.push_back({
+                    ctree,
+                    std::move(next_ptrees),
+                    std::vector<size_t>(nparents, 0),
+                    0,
+                    path,
+                    true
+                });
             }
+
             frame.cidx++;
         }
 
@@ -595,6 +804,67 @@ static void compare_tree_nway(
             }
         }
     }
+}
+
+// process blob events created by
+// emit_add_blob and emit_delete_blob
+static void process_blob_events(Context *ctx)
+{
+    std::unordered_set<git_oid, OidHash, OidEq> adds;
+    std::unordered_set<git_oid, OidHash, OidEq> dels;
+
+    // FIXME this does not support
+    // simultaneous rename and copy operations
+    // so when a file A was both renamed to B and copied to C
+    // then the "copied to C" part is ignored
+
+    for (auto &oid : ctx->added_blobs)
+        adds.insert(oid);
+
+    for (auto &oid : ctx->deleted_blobs)
+        dels.insert(oid);
+
+    // remove renames/copies
+    for (auto it = adds.begin(); it != adds.end(); )
+    {
+        auto dit = dels.find(*it);
+        if (dit != dels.end())
+        {
+            dels.erase(*it);
+            it = adds.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // remaining adds are true introductions
+    for (const auto &oid : adds)
+    {
+        auto kv = ctx->blobs.find(oid);
+        if (kv == ctx->blobs.end())
+            continue;
+        if (!kv->second.has_time)
+        {
+            kv->second.time = ctx->time;
+            kv->second.has_time = true;
+            ctx->files_found++;
+            // output result as soon as possible
+            // std::cout << ctx->time << " " << kv->second.path << "\n";
+            std::cout << kv->second.time << " " << kv->second.path << "\n";
+            // TODO erase is wrong?
+            // // remove blob from our todo list
+            // ctx->blobs.erase(kv);
+        }
+    }
+
+    ctx->added_blobs.clear();
+    ctx->deleted_blobs.clear();
+
+    // // free memory
+    // ctx->added_blobs.shrink_to_fit();
+    // ctx->deleted_blobs.shrink_to_fit();
 }
 
 int main() {
@@ -739,6 +1009,8 @@ int main() {
 
         compare_tree_nway(tree, ctx->parent_trees, "", ctx.get());
 
+        process_blob_events(ctx.get());
+
         // free memory
         // TODO cache trees and subtrees
         if (parent_tree) {
@@ -755,6 +1027,10 @@ int main() {
         git_commit_free(commit);
         commits_freed++;
 
+        // TODO restore. stop early if we have all file times
+        // or what is the current stop condition?
+        // the program stops if (files_done == ctx->blobs.size())
+        // but why...?
         // // stop early
         // if (ctx->remaining.empty())
         //     break;
