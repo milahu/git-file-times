@@ -2,8 +2,8 @@
 
 **User:** Anonymous  
 **Created:** 2026/6/12 13:21:13  
-**Updated:** 2026/6/19 11:56:28  
-**Exported:** 2026/6/19 13:59:13  
+**Updated:** 2026/6/21 18:53:57  
+**Exported:** 2026/6/21 18:56:18  
 **Link:** [<https://chatgpt.com/c/6a2beb3b-e420-83eb-8561-02c1542acde9>](https://chatgpt.com/c/6a2beb3b-e420-83eb-8561-02c1542acde9)
 
 ## Prompt:
@@ -37126,6 +37126,10835 @@ ctx->parent_trees.clear();
 otherwise a large repo with many merges will steadily leak memory.
 
 The key bug causing your fuzz failures, though, is that the `cmp == 0 && blob != blob` path still only reasons about the first parent. That's exactly what the `file3.txt` and `file0.txt` failures are demonstrating.
+
+## Prompt:
+
+6/19/2026, 2:13:55 PM
+
+give me a full compare_tree function that handles multiple parent trees
+
+## Response:
+
+6/19/2026, 2:14:00 PM
+
+I would not try to extend your current merge-walk algorithm to N parents. It becomes surprisingly messy because:
+
+``` text
+parent1 tree
+parent2 tree
+parent3 tree
+current tree
+```
+
+don't have a natural synchronized traversal.
+
+Instead, for merge commits, do something much simpler:
+
+1.  Walk the current tree recursively.
+2.  For every blob in the current tree:
+    - build its full path
+    - check whether the same `(path, blob_oid)` exists in any parent tree
+3.  If yes → blob was copied from a parent → ignore.
+4.  If no → blob was introduced by the merge → assign timestamp.
+
+Then keep your existing `compare_tree()` for ordinary commits.
+
+------------------------------------------------------------------------
+
+Something like:
+
+``` cpp
+static void compare_tree_merge(
+    git_tree *current,
+    const std::string &current_root,
+    Context *ctx)
+{
+    const size_t current_n = git_tree_entrycount(current);
+
+    for (size_t c = 0; c < current_n; ++c)
+    {
+        const git_tree_entry *ce =
+            git_tree_entry_byindex(current, c);
+
+        auto ctype = git_tree_entry_type(ce);
+
+        if (ctype == GIT_OBJECT_BLOB)
+        {
+            const git_oid *coid =
+                git_tree_entry_id(ce);
+
+            std::string path =
+                join_paths_3(
+                    current_root,
+                    "",
+                    git_tree_entry_name(ce));
+
+            bool existed_in_any_parent = false;
+
+            for (auto *parent_tree : ctx->parent_trees)
+            {
+                if (tree_contains_blob_at_path(
+                        parent_tree,
+                        path,
+                        coid,
+                        ctx))
+                {
+                    existed_in_any_parent = true;
+                    break;
+                }
+            }
+
+            if (!existed_in_any_parent)
+            {
+                auto it = ctx->blobs.find(*coid);
+
+                if (it != ctx->blobs.end())
+                {
+                    if (!it->second.has_time)
+                    {
+                        if (DEBUG)
+                        {
+                            std::cerr
+                                << "merge: setting time: path="
+                                << path
+                                << " time="
+                                << ctx->time
+                                << " commit="
+                                << git_oid_tostr_s(ctx->oid)
+                                << "\n";
+                        }
+
+                        it->second.time = ctx->time;
+                        it->second.has_time = true;
+                        ctx->num_remaining--;
+                        ctx->files_found++;
+                    }
+                }
+            }
+        }
+        else if (ctype == GIT_OBJECT_TREE)
+        {
+            git_tree *ctree = nullptr;
+
+            git_tree_lookup(
+                &ctree,
+                ctx->repo,
+                git_tree_entry_id(ce));
+
+            std::string croot =
+                join_paths_3(
+                    current_root,
+                    "",
+                    git_tree_entry_name(ce));
+
+            compare_tree_merge(
+                ctree,
+                croot,
+                ctx);
+
+            git_tree_free(ctree);
+        }
+    }
+}
+```
+
+Then in `main()`:
+
+``` cpp
+if (ctx->is_merge)
+{
+    compare_tree_merge(
+        tree,
+        "",
+        ctx.get());
+}
+else
+{
+    compare_tree(
+        parent_tree,
+        tree,
+        "",
+        "",
+        ctx.get());
+}
+```
+
+------------------------------------------------------------------------
+
+Why this works for your failing case:
+
+``` text
+merge commit 8a40c6f
+
+left  parent: file3 = blob A
+right parent: file3 = blob B
+merge result: file3 = blob B
+```
+
+`compare_tree_merge()` checks:
+
+``` text
+(path=file3.txt, blob=B)
+```
+
+against every parent.
+
+Parent \#2 already has `(file3.txt, blob=B)`.
+
+Therefore:
+
+``` text
+existed_in_any_parent = true
+```
+
+and no timestamp is assigned.
+
+So file3 keeps the timestamp from commit:
+
+``` text
+c4d442a
+```
+
+which matches your expected result.
+
+------------------------------------------------------------------------
+
+In fact, for merge commits you can completely ignore parent-vs-current diffs. The semantic question is only:
+
+> "Did this exact blob at this exact path already exist in at least one parent?"
+
+If yes, it is inherited. If no, it was created by the merge. That's exactly the property your fuzz tests are trying to verify.
+
+## Prompt:
+
+6/19/2026, 2:42:16 PM
+
+ok, but compare_tree_merge is really slow.... in total, my commit speed drops from 1000 c/s to 0.1 c/s = slower by factor 10K
+
+ideas to make this faster?
+
+## Response:
+
+6/19/2026, 2:42:22 PM
+
+Yes. The problem is that `compare_tree_merge()` as written is effectively:
+
+``` text
+for every blob in merge tree:
+    for every parent:
+        git_tree_entry_bypath(...)
+```
+
+and `git_tree_entry_bypath()` is expensive because it walks the tree from the root every time.
+
+So your complexity becomes roughly:
+
+``` text
+O(files_in_merge × parents × path_lookup_cost)
+```
+
+which is terrible.
+
+------------------------------------------------------------------------
+
+## First observation
+
+You are walking history backwards.
+
+You only care about blobs that are currently in HEAD:
+
+``` cpp
+ctx->blobs.find(*coid)
+```
+
+So most files in most merge commits are irrelevant.
+
+Yet `compare_tree_merge()` recursively walks the entire merge tree.
+
+That means you're doing work for thousands of files that are not even in HEAD.
+
+------------------------------------------------------------------------
+
+## Better approach: compare trees, don't do path lookups
+
+Your existing non-merge algorithm is fast because it does:
+
+``` text
+parent tree
+current tree
+```
+
+simultaneous sorted walk.
+
+Complexity:
+
+``` text
+O(parent_entries + current_entries)
+```
+
+No path lookups.
+
+The merge version should preserve that property.
+
+------------------------------------------------------------------------
+
+## Even better: use libgit2 diff
+
+For a merge commit:
+
+``` cpp
+git_diff_tree_to_tree(...)
+```
+
+against each parent.
+
+Then examine only changed files.
+
+For parent i:
+
+``` cpp
+git_diff_tree_to_tree(
+    &diff,
+    repo,
+    parent_tree,
+    current_tree,
+    nullptr);
+```
+
+Now you only see paths where:
+
+``` text
+parent_i != merge_commit
+```
+
+------------------------------------------------------------------------
+
+Then for each delta:
+
+``` cpp
+new path
+new blob oid
+```
+
+check whether some OTHER parent already contains that blob.
+
+Example:
+
+``` text
+parent1: file3=A
+parent2: file3=B
+merge:   file3=B
+```
+
+Diff against parent1:
+
+``` text
+file3 changed A -> B
+```
+
+Diff against parent2:
+
+``` text
+no change
+```
+
+So when processing parent1's diff, you discover:
+
+``` text
+blob B already exists in parent2
+```
+
+therefore not introduced by merge.
+
+------------------------------------------------------------------------
+
+## Even faster: prebuild path→oid maps for merge parents
+
+For a merge commit, construct:
+
+``` cpp
+unordered_map<string, git_oid>
+```
+
+for each parent tree.
+
+Example:
+
+``` cpp
+parent_maps[0]["file3.txt"] = blobA
+parent_maps[1]["file3.txt"] = blobB
+```
+
+One recursive tree walk per parent.
+
+Then:
+
+``` cpp
+auto it = parent_maps[i].find(path);
+
+if (it != end &&
+    git_oid_equal(&it->second, coid))
+{
+    existed_in_parent = true;
+}
+```
+
+Now lookup is O(1).
+
+------------------------------------------------------------------------
+
+## But there's an even bigger optimization
+
+Your current code repeatedly walks merge trees.
+
+Imagine:
+
+``` text
+HEAD
+ |
+merge M
+ |
+...
+```
+
+When traversing history backwards, once:
+
+``` cpp
+it->second.has_time == true
+```
+
+you don't care anymore.
+
+You're already doing:
+
+``` cpp
+if (!it->second.has_time)
+```
+
+but only after lots of tree traversal.
+
+You could prune much earlier.
+
+------------------------------------------------------------------------
+
+## The real solution
+
+I think you're reinventing something Git already computes efficiently:
+
+For every commit, instead of recursively comparing trees, ask libgit2 for the diff.
+
+Something like:
+
+``` cpp
+git_diff_tree_to_tree(
+    &diff,
+    repo,
+    parent_tree,
+    current_tree,
+    nullptr);
+```
+
+Then iterate deltas.
+
+Complexity becomes proportional to changed files:
+
+``` text
+O(number_of_changed_paths)
+```
+
+instead of
+
+``` text
+O(size_of_tree)
+```
+
+For large repositories that's often 100–10000× less work.
+
+------------------------------------------------------------------------
+
+## What I'd do
+
+Keep your current fast code for:
+
+``` text
+parentcount == 0
+parentcount == 1
+```
+
+For merges:
+
+1.  Build a path→blob map for each parent once.
+2.  Walk only the merge tree entries that differ from parent1 (or use `git_diff_tree_to_tree`).
+3.  For each changed blob:
+    - check all parent maps.
+    - if any parent has identical `(path, oid)`, skip.
+    - otherwise assign timestamp.
+
+That gets you back close to your original speed while still handling merges correctly.
+
+The biggest performance killer in your current `compare_tree_merge()` is almost certainly the repeated calls to:
+
+``` cpp
+git_tree_entry_bypath()
+```
+
+inside nested loops. Each one starts a fresh tree lookup from the root, and you're doing that for every blob in every merge commit. That's where the ~10,000× slowdown is coming from.
+
+## Prompt:
+
+6/19/2026, 2:53:15 PM
+
+git_diff_tree_to_tree does too much work = is too slow
+
+building a path-\>oid map for all trees is wasteful. i suggest we only build a path-\>oid map for the current tree, and do a merge walk between the current tree and all parent trees
+
+or we build a path-\>oid map for all trees, and cache all the maps in ctx, because a parent tree in the current iteration becomes the current tree in the next iteration, so we can re-use the tree in the next iteration, and when we no longer need the tree, we can drop it from the cache
+
+also it would be nice to have a generic compare_tree function that works in all cases (non-merge commits and merge commits)
+
+## Response:
+
+6/19/2026, 2:53:20 PM
+
+I agree with your direction. I think the previous `compare_tree_merge()` proposal is correct semantically but wrong architecturally for performance.
+
+The key observation is:
+
+> Your existing code is fast because it does a merge-walk over sorted tree entries.  
+> You should preserve that property.
+
+Doing repeated:
+
+``` cpp
+git_tree_entry_bypath(...)
+```
+
+throws away the main advantage of Git trees.
+
+------------------------------------------------------------------------
+
+## What compare_tree is really doing
+
+For a normal commit:
+
+``` text
+parent tree
+current tree
+```
+
+you are computing:
+
+``` text
+(path, blob_oid_current)
+appears for first time?
+```
+
+by walking two sorted trees simultaneously.
+
+For a merge commit:
+
+``` text
+parent1
+parent2
+...
+parentN
+current
+```
+
+the question becomes:
+
+``` text
+does (path, blob_oid_current)
+exist in ANY parent tree?
+```
+
+So conceptually you want an N-way merge walk.
+
+------------------------------------------------------------------------
+
+## Option 1: current-tree map only
+
+I think this is the cleanest.
+
+Build:
+
+``` cpp
+unordered_map<string, git_oid> current_map;
+```
+
+for the current tree.
+
+Only for merge commits.
+
+Then walk each parent tree once:
+
+``` text
+parent1 -> current_map
+parent2 -> current_map
+...
+```
+
+For every matching path:
+
+``` cpp
+if (git_oid_equal(parent_oid, current_oid))
+{
+    mark_inherited(path);
+}
+```
+
+At the end:
+
+``` cpp
+for every current blob:
+    if not inherited:
+         timestamp = merge commit time
+```
+
+Complexity:
+
+``` text
+O(current_tree_size + sum(parent_tree_sizes))
+```
+
+which is basically optimal.
+
+------------------------------------------------------------------------
+
+## Option 2: cache path maps
+
+This is probably even better.
+
+You already noticed:
+
+``` text
+walk order:
+
+M
+|
+P
+|
+G
+```
+
+When processing:
+
+``` text
+M
+```
+
+you build:
+
+``` cpp
+map(M)
+```
+
+Then later:
+
+``` text
+P
+```
+
+needs exactly that same map.
+
+So you can cache:
+
+``` cpp
+unordered_map<git_oid, TreeMap>
+```
+
+where key = tree oid.
+
+Something like:
+
+``` cpp
+struct TreeMap {
+    std::unordered_map<std::string, git_oid> entries;
+};
+```
+
+Then:
+
+``` cpp
+TreeMap& get_tree_map(tree_oid);
+```
+
+builds lazily.
+
+------------------------------------------------------------------------
+
+## Even better: cache only trees participating in merges
+
+Most commits are not merges.
+
+So:
+
+``` cpp
+if (parentcount <= 1)
+```
+
+continue using your current fast algorithm.
+
+Only when:
+
+``` cpp
+parentcount > 1
+```
+
+build/cache path maps.
+
+Then cache hit rate becomes very high because merge parents are typically visited immediately afterwards.
+
+------------------------------------------------------------------------
+
+## Generic compare_tree
+
+I think you can make one generic function.
+
+Something like:
+
+``` cpp
+compare_tree(
+    std::span<git_tree*> parents,
+    git_tree* current,
+    Context* ctx);
+```
+
+Then:
+
+### single-parent case
+
+``` cpp
+parents.size() == 1
+```
+
+use your existing merge-walk algorithm.
+
+### merge case
+
+``` cpp
+parents.size() > 1
+```
+
+use map-based algorithm.
+
+Same API, different implementation branch.
+
+------------------------------------------------------------------------
+
+## But there is an even nicer formulation
+
+Think in terms of current blobs instead of tree diffs.
+
+Build:
+
+``` cpp
+current[path] -> blob_oid
+```
+
+Then for every parent:
+
+``` cpp
+parent[path] -> blob_oid
+```
+
+For each path:
+
+``` cpp
+if any parent[path] == current[path]
+    inherited
+else
+    introduced_here
+```
+
+This exactly matches the semantics you're after.
+
+Example:
+
+``` text
+parent1 file3=A
+parent2 file3=B
+merge   file3=B
+```
+
+Current map:
+
+``` text
+file3 -> B
+```
+
+Parent maps:
+
+``` text
+file3 -> A
+file3 -> B
+```
+
+One parent matches:
+
+``` text
+inherited
+```
+
+so no timestamp assignment.
+
+------------------------------------------------------------------------
+
+## What I would implement
+
+I would keep your existing code completely unchanged for:
+
+``` cpp
+parentcount == 0
+parentcount == 1
+```
+
+because it's already very fast.
+
+Then add:
+
+``` cpp
+compare_tree_merge(
+    std::vector<git_tree*>& parents,
+    git_tree* current,
+    Context* ctx);
+```
+
+implemented using cached path→oid maps.
+
+Trying to force the existing two-tree merge-walk into an N-parent merge-walk will get ugly fast:
+
+``` text
+current
+parent1
+parent2
+parent3
+...
+```
+
+because now you need N cursors and complicated ordering logic.
+
+A temporary path map for merge commits is much simpler, and if you cache by tree OID, the cost is paid only once per tree over the whole revwalk. In practice that should be much closer to your original 1000 commits/sec than the repeated `git_tree_entry_bypath()` approach.
+
+## Prompt:
+
+6/19/2026, 4:24:43 PM
+
+> ## Even better: cache only trees participating in merges
+
+no, i want to cache all trees (path-\>oid maps), because the parent tree of the current iteration will be the current tree of the next iteration
+
+maybe i will also need the inverse (oid-\>path maps) to detect renames
+
+## Response:
+
+6/19/2026, 4:24:48 PM
+
+Yes, if you're already willing to build path maps, then caching **all trees** is much more sensible than caching only merge trees.
+
+Your revwalk is:
+
+``` text
+HEAD
+ |
+A
+ |
+B
+ |
+C
+```
+
+and for commit `A` you need:
+
+``` text
+current_tree(A)
+parent_tree(B)
+```
+
+Then one iteration later:
+
+``` text
+current_tree(B)
+parent_tree(C)
+```
+
+So the tree that was a parent in one iteration immediately becomes the current tree in the next iteration.
+
+In other words, a large fraction of tree-map construction can be reused.
+
+------------------------------------------------------------------------
+
+I'd probably add something like:
+
+``` cpp
+struct TreeCacheEntry {
+    std::unordered_map<std::string, git_oid, OidHash, OidEq> path_to_oid;
+};
+```
+
+Actually for `path_to_oid` the key is string, so:
+
+``` cpp
+struct TreeCacheEntry {
+    std::unordered_map<std::string, git_oid> path_to_oid;
+};
+```
+
+and then:
+
+``` cpp
+std::unordered_map<git_oid, TreeCacheEntry, OidHash, OidEq>
+    tree_cache;
+```
+
+inside `Context`.
+
+Then:
+
+``` cpp
+TreeCacheEntry& get_tree_cache(
+    git_tree* tree,
+    Context* ctx);
+```
+
+would:
+
+1.  get tree oid
+
+``` cpp
+const git_oid* oid = git_tree_id(tree);
+```
+
+2.  lookup cache
+
+3.  build map if missing
+
+4.  return reference
+
+------------------------------------------------------------------------
+
+Complexity becomes:
+
+``` text
+before:
+    O(tree_size)
+    every time tree is visited
+
+after:
+    O(tree_size)
+    once per tree
+
+    O(1)
+    for all later uses
+```
+
+which is much more attractive.
+
+------------------------------------------------------------------------
+
+## Rename detection
+
+If you want rename detection later, yes, you'll almost certainly want the inverse map too.
+
+Something like:
+
+``` cpp
+struct TreeCacheEntry {
+    std::unordered_map<std::string, git_oid> path_to_oid;
+
+    std::unordered_multimap<git_oid, std::string,
+        OidHash, OidEq> oid_to_path;
+};
+```
+
+I would use a **multimap** (or unordered_multimap) because identical blobs can appear at multiple paths:
+
+``` text
+a.txt -> blob X
+b.txt -> blob X
+```
+
+Then:
+
+``` cpp
+oid_to_path[X]
+```
+
+returns all paths containing that blob.
+
+That's useful for:
+
+``` text
+rename
+copy
+hard-linked content
+```
+
+style analysis.
+
+------------------------------------------------------------------------
+
+## Generic compare_tree
+
+I think a generic API is feasible:
+
+``` cpp
+void compare_tree(
+    const std::vector<git_tree*>& parents,
+    git_tree* current,
+    Context* ctx);
+```
+
+Then:
+
+### Fast path
+
+``` cpp
+parents.size() == 0
+```
+
+root commit
+
+### Fast path
+
+``` cpp
+parents.size() == 1
+```
+
+use your existing merge-walk code
+
+This is still the fastest possible approach.
+
+### Merge path
+
+``` cpp
+parents.size() > 1
+```
+
+use cached maps.
+
+For each current blob:
+
+``` cpp
+(path, oid)
+```
+
+check:
+
+``` cpp
+exists in any parent:
+    same path
+    same oid
+```
+
+If yes:
+
+``` text
+inherited
+```
+
+Otherwise:
+
+``` text
+introduced by merge
+```
+
+------------------------------------------------------------------------
+
+## One thing I'd avoid
+
+I would *not* replace the single-parent merge-walk with path maps.
+
+Your current algorithm:
+
+``` text
+parent tree
+current tree
+```
+
+is basically optimal:
+
+``` text
+O(parent_entries + current_entries)
+```
+
+with excellent cache locality and no hash lookups.
+
+The path-map approach is only attractive when:
+
+``` text
+number_of_parents > 1
+```
+
+because N-way tree walking becomes complicated.
+
+So my design would be:
+
+``` cpp
+compare_tree(...)
+{
+    if (parents.empty())
+        compare_root(...);
+
+    else if (parents.size() == 1)
+        compare_tree_two_way(...);   // current code
+
+    else
+        compare_tree_merge_cached(...);
+}
+```
+
+using a cache of **all** tree maps, not just merge trees.
+
+That gives you:
+
+- current fast performance for ordinary commits,
+- correct merge handling,
+- reusable infrastructure for future rename detection.
+
+## Prompt:
+
+6/19/2026, 4:32:48 PM
+
+> because N-way tree walking becomes complicated.
+
+but N-way tree walking is faster, because we dont have to recurse into identical subtrees. in comparison, visiting all nodes of all trees would be wasteful, because many subtrees are identical, because most commits modify only few files..... ideas?
+
+## Response:
+
+6/19/2026, 4:32:53 PM
+
+You're right. My previous suggestion implicitly assumes:
+
+``` text
+build full path->oid map for every tree
+```
+
+which throws away one of Git's biggest optimizations:
+
+> identical subtrees are represented by identical tree OIDs.
+
+Your current algorithm exploits that:
+
+``` cpp
+if (!git_oid_equal(poid, coid))
+{
+    compare_tree(ptree, ctree, ...)
+}
+```
+
+so entire directories get skipped.
+
+If a repo has:
+
+``` text
+100000 files
+src/
+docs/
+vendor/
+...
+```
+
+and one commit changes:
+
+``` text
+src/foo.cpp
+```
+
+then Git only creates new tree objects on the path:
+
+``` text
+/
+└── src/
+    └── foo.cpp
+```
+
+Everything else reuses existing tree OIDs.
+
+Your current algorithm visits roughly:
+
+``` text
+O(changed_path_depth)
+```
+
+not
+
+``` text
+O(repository_size)
+```
+
+which is why it's fast.
+
+------------------------------------------------------------------------
+
+## What merge commits really require
+
+For a merge commit with:
+
+``` text
+P1
+P2
+...
+Pn
+C
+```
+
+you want:
+
+``` text
+for every blob in C:
+    if identical blob exists at same path in any parent:
+        inherited
+    else:
+        introduced by merge
+```
+
+But you do **not** need full path maps to answer that.
+
+------------------------------------------------------------------------
+
+## A true N-way tree walk
+
+What I'd try is:
+
+``` cpp
+compare_tree(
+    vector<git_tree*> parents,
+    git_tree* current
+)
+```
+
+where recursion happens only when needed.
+
+At each directory level:
+
+1.  Collect all entry names appearing in:
+
+    - current
+    - all parents
+
+2.  For each name:
+
+    - look up entry in current
+    - look up entry in each parent
+
+3.  Handle cases.
+
+------------------------------------------------------------------------
+
+### Case 1: current entry absent
+
+Nothing to do.
+
+------------------------------------------------------------------------
+
+### Case 2: blob in current
+
+Suppose:
+
+``` text
+current:
+    foo -> oidX
+
+parent1:
+    foo -> oidX
+
+parent2:
+    foo -> oidY
+```
+
+Then:
+
+``` cpp
+for every parent:
+    if parent has blob &&
+       oid_equal(parent_oid, current_oid)
+        inherited=true
+```
+
+No recursion.
+
+------------------------------------------------------------------------
+
+### Case 3: subtree in current
+
+Suppose:
+
+``` text
+current:
+    src -> treeA
+```
+
+and parents:
+
+``` text
+parent1:
+    src -> treeA
+
+parent2:
+    src -> treeB
+```
+
+Then:
+
+``` cpp
+if any parent_tree_oid == current_tree_oid
+{
+    // entire subtree inherited
+    continue;
+}
+```
+
+This is the crucial optimization.
+
+You skip the whole subtree immediately.
+
+------------------------------------------------------------------------
+
+Only when:
+
+``` text
+current tree oid differs
+from every parent tree oid
+```
+
+do you recurse.
+
+------------------------------------------------------------------------
+
+## Why this is much faster
+
+Imagine:
+
+``` text
+merge commit
+
+current tree
+├── src
+├── docs
+├── vendor
+└── tests
+```
+
+and:
+
+``` text
+vendor tree oid
+```
+
+matches parent2 exactly.
+
+Then:
+
+``` cpp
+git_oid_equal(current_vendor_oid,
+              parent2_vendor_oid)
+```
+
+is enough to conclude:
+
+``` text
+everything below vendor/
+was inherited
+```
+
+No path map.  
+No recursion.  
+No visiting files.
+
+Exactly the optimization Git's tree structure was designed for.
+
+------------------------------------------------------------------------
+
+## Another optimization
+
+You don't actually need an N-way merge walk in lockstep.
+
+You can recurse from the current tree only.
+
+Pseudo:
+
+``` cpp
+visit(current_subtree, parent_subtrees)
+{
+    if current_subtree_oid
+       matches any parent_subtree_oid
+    {
+        return;
+    }
+
+    recurse into entries
+}
+```
+
+Notice what happened:
+
+``` text
+current tree
+```
+
+drives the traversal.
+
+Parents are only consulted for equivalence checks.
+
+This avoids constructing the union of entry names across all parents.
+
+------------------------------------------------------------------------
+
+Conceptually:
+
+``` cpp
+walk_current(current, parents)
+{
+    if subtree_oid exists in any parent
+        return;
+
+    if blob_oid exists in any parent at same path
+        return;
+
+    recurse
+}
+```
+
+That gives you the same asymptotic benefit as your current two-way walk:
+
+``` text
+work ≈ changed regions of tree
+```
+
+instead of:
+
+``` text
+work ≈ total files in all trees
+```
+
+------------------------------------------------------------------------
+
+So if your goal is maximum speed, I would **not** build path maps at all.
+
+I'd generalize the existing recursive tree comparison into:
+
+``` cpp
+compare_tree(
+    std::vector<git_tree*> parents,
+    git_tree* current,
+    ...
+)
+```
+
+and make the first operation at every recursion level:
+
+``` cpp
+if current_tree_oid matches any parent_tree_oid
+    return;
+```
+
+because that's where almost all the performance comes from. The complexity of the N-way walk is worth it if your objective is to preserve Git's subtree-sharing optimization.
+
+## Prompt:
+
+6/19/2026, 4:54:26 PM
+
+what feels stupid about this is that i am trying to re-invent something that is already implemented in git.... for tree-versus-tree comparisons i want a simplified version of git_diff_tree_to_tree (which does not compute all the diffs, but which only returns file paths that were modified or added or renamed), and for tree-versus-multiple-trees comparisons i want a simplified version of the corresponding function in git
+
+i have already modified libgit2 to export all the internal functions, so we can build something like git_diff_tree_to_tree in libgit2/src/libgit2/diff_generate.c
+
+``` c
+int git_diff_tree_to_tree(
+    git_diff **out,
+    git_repository *repo,
+    git_tree *old_tree,
+    git_tree *new_tree,
+    const git_diff_options *opts)
+{
+    git_iterator_flag_t iflag = GIT_ITERATOR_DONT_IGNORE_CASE;
+    git_iterator_options a_opts = GIT_ITERATOR_OPTIONS_INIT,
+        b_opts = GIT_ITERATOR_OPTIONS_INIT;
+    git_iterator *a = NULL, *b = NULL;
+    git_diff *diff = NULL;
+    char *prefix = NULL;
+    int error = 0;
+
+    GIT_ASSERT_ARG(out);
+    GIT_ASSERT_ARG(repo);
+
+    *out = NULL;
+
+    /* for tree to tree diff, be case sensitive even if the index is
+     * currently case insensitive, unless the user explicitly asked
+     * for case insensitivity
+     */
+    if (opts && (opts->flags & GIT_DIFF_IGNORE_CASE) != 0)
+        iflag = GIT_ITERATOR_IGNORE_CASE;
+
+    if ((error = diff_prepare_iterator_opts(&prefix, &a_opts, iflag, &b_opts, iflag, opts)) < 0 ||
+        (error = git_iterator_for_tree(&a, old_tree, &a_opts)) < 0 ||
+        (error = git_iterator_for_tree(&b, new_tree, &b_opts)) < 0 ||
+        (error = git_diff__from_iterators(&diff, repo, a, b, opts)) < 0)
+        goto out;
+
+    *out = diff;
+    diff = NULL;
+out:
+    git_iterator_free(a);
+    git_iterator_free(b);
+    git_diff_free(diff);
+    git__free(prefix);
+
+    return error;
+}
+
+int git_diff__from_iterators(
+    git_diff **out,
+    git_repository *repo,
+    git_iterator *old_iter,
+    git_iterator *new_iter,
+    const git_diff_options *opts)
+{
+    git_diff_generated *diff;
+    diff_in_progress info = {0};
+    int error = 0;
+
+    *out = NULL;
+
+    diff = diff_generated_alloc(repo, old_iter, new_iter);
+    GIT_ERROR_CHECK_ALLOC(diff);
+
+    info.repo = repo;
+    info.old_iter = old_iter;
+    info.new_iter = new_iter;
+
+    /* make iterators have matching icase behavior */
+    if (DIFF_FLAG_IS_SET(diff, GIT_DIFF_IGNORE_CASE)) {
+        if ((error = git_iterator_set_ignore_case(old_iter, true)) < 0 ||
+            (error = git_iterator_set_ignore_case(new_iter, true)) < 0)
+            goto cleanup;
+    }
+
+    /* finish initialization */
+    if ((error = diff_generated_apply_options(diff, opts)) < 0)
+        goto cleanup;
+
+    if ((error = iterator_current(&info.oitem, old_iter)) < 0 ||
+        (error = iterator_current(&info.nitem, new_iter)) < 0)
+        goto cleanup;
+
+    /* run iterators building diffs */
+    while (!error && (info.oitem || info.nitem)) {
+        int cmp;
+
+        /* report progress */
+        if (opts && opts->progress_cb) {
+            if ((error = opts->progress_cb(&diff->base,
+                    info.oitem ? info.oitem->path : NULL,
+                    info.nitem ? info.nitem->path : NULL,
+                    opts->payload)))
+                break;
+        }
+
+        cmp = info.oitem ?
+            (info.nitem ? diff->base.entrycomp(info.oitem, info.nitem) : -1) : 1;
+
+        /* create DELETED records for old items not matched in new */
+        if (cmp < 0)
+            error = handle_unmatched_old_item(diff, &info);
+
+        /* create ADDED, TRACKED, or IGNORED records for new items not
+         * matched in old (and/or descend into directories as needed)
+         */
+        else if (cmp > 0)
+            error = handle_unmatched_new_item(diff, &info);
+
+        /* otherwise item paths match, so create MODIFIED record
+         * (or ADDED and DELETED pair if type changed)
+         */
+        else
+            error = handle_matched_item(diff, &info);
+    }
+
+    diff->base.perf.stat_calls +=
+        old_iter->stat_calls + new_iter->stat_calls;
+
+cleanup:
+    if (!error)
+        *out = &diff->base;
+    else
+        git_diff_free(&diff->base);
+    if (info.submodule_cache)
+        git_submodule_cache_free(info.submodule_cache);
+
+    return error;
+}
+```
+
+## Response:
+
+6/19/2026, 4:54:32 PM
+
+This is actually the point where I would stop writing tree-walking code yourself. Your intuition is right: Git already has almost exactly the primitive you need.
+
+The important detail is: **you don't need the diff output**. You need the *iterator machinery* and the *tree pruning behavior*.
+
+The good news is that `git_diff__from_iterators()` already does most of the hard work.
+
+Your desired function is basically:
+
+``` c
+tree_compare_one_parent(old, new)
+    -> return paths where new blob is not identical to old blob
+```
+
+and Git already does:
+
+``` c
+handle_matched_item()
+handle_unmatched_new_item()
+handle_unmatched_old_item()
+```
+
+with subtree skipping.
+
+------------------------------------------------------------------------
+
+## For single-parent commits
+
+I would literally reuse:
+
+``` cpp
+git_iterator_for_tree()
+git_diff__from_iterators()
+```
+
+but change the output stage.
+
+Instead of:
+
+``` c
+git_diff_delta
+```
+
+you want:
+
+``` c
+struct changed_path {
+    const char *path;
+    const git_oid *new_oid;
+};
+```
+
+You can add a callback in `diff_in_progress`.
+
+Something like:
+
+``` c
+typedef int (*git_diff_path_cb)(
+    const char *path,
+    const git_oid *oid,
+    void *payload);
+```
+
+Then inside:
+
+``` c
+handle_matched_item()
+```
+
+where Git currently creates:
+
+``` c
+GIT_DELTA_MODIFIED
+```
+
+you call:
+
+``` c
+if (cb)
+    cb(
+        info.nitem->path,
+        git_tree_entry_id(info.nitem->entry),
+        payload
+    );
+```
+
+For additions:
+
+``` c
+handle_unmatched_new_item()
+```
+
+same.
+
+That gives you your fast path.
+
+------------------------------------------------------------------------
+
+## For merge commits
+
+The trick is not to make an N-way diff.
+
+Do:
+
+    current tree
+        |
+        +--> diff with parent1
+        |
+        +--> diff with parent2
+        |
+        +--> ...
+
+but invert the question.
+
+You don't care about "changed relative to parent".
+
+You care:
+
+    was this blob/path present in ANY parent?
+
+So keep a small structure:
+
+``` cpp
+struct SeenInParents {
+    unordered_set<git_oid, OidHash, OidEq> blobs;
+};
+```
+
+Then:
+
+1.  Run your modified diff collector against each parent:
+
+<!-- -->
+
+    parent -> current
+
+2.  But instead of collecting "changes", collect all parent blobs that match current paths.
+
+Actually you can simplify:
+
+For each parent:
+
+    diff(parent,current)
+
+The unmatched-new and modified cases tell you:
+
+    current has something parent doesn't have
+
+Those are candidates.
+
+For candidates, test other parents.
+
+------------------------------------------------------------------------
+
+But there is an even better way using Git's own iterators.
+
+`git_iterator` already has a recursive tree walk with pruning.
+
+Make a new iterator type:
+
+    multi_tree_iterator
+
+or simpler:
+
+``` c
+git_iterator_for_tree_multi()
+```
+
+Internally:
+
+``` c
+struct multi_iterator {
+    git_iterator *current;
+    git_iterator **parents;
+};
+```
+
+Then the comparison is:
+
+``` c
+while(current)
+{
+    item = iterator_current(current);
+
+    for each parent:
+        pitem = lookup_same_path(parent);
+
+        if same tree oid:
+             skip subtree
+             goto next;
+
+        if same blob oid:
+             inherited=true;
+}
+```
+
+This is basically what Git's diff engine does already.
+
+------------------------------------------------------------------------
+
+## The really nice optimization
+
+You noticed this:
+
+> many subtrees are identical
+
+This is exactly why Git iterators exist.
+
+When the diff sees:
+
+    src/
+
+and:
+
+    parent/src tree oid == current/src tree oid
+
+it never descends.
+
+A hand-written path map loses this.
+
+------------------------------------------------------------------------
+
+## I would structure git-file-times like this
+
+Replace:
+
+``` cpp
+compare_tree(parent, current)
+```
+
+with:
+
+``` cpp
+compare_tree(
+    std::vector<git_tree*> parents,
+    git_tree *current,
+    Context *ctx)
+```
+
+Implementation:
+
+``` cpp
+if parents.size() == 0:
+    root_commit_fast_path()
+
+else if parents.size() == 1:
+    git_diff_style_two_tree_walk()
+
+else:
+    git_diff_style_multi_parent_walk()
+```
+
+But the two-tree walk should actually move into libgit2.
+
+------------------------------------------------------------------------
+
+## One more thought: don't use `git_diff_tree_to_tree`
+
+The public diff API is still too high-level.
+
+It allocates:
+
+- diff objects
+- deltas
+- strings
+- patches
+- similarity data
+
+You don't need any of that.
+
+The sweet spot is exactly where you are looking:
+
+    git_diff__from_iterators()
+
+with a stripped-down consumer.
+
+You basically want:
+
+    git_diff_tree_to_tree_light()
+
+which returns:
+
+    (path, old_oid?, new_oid?)
+
+and nothing else.
+
+That should probably be only ~100 lines of libgit2 changes.
+
+This will also solve your merge problem because then your C++ code no longer needs to know about Git tree ordering, subtree pruning, or iterator internals. You reuse the code Git itself uses.
+
+## Prompt:
+
+6/19/2026, 5:25:12 PM
+
+> That should probably be only ~100 lines of libgit2 changes.
+
+yes, ultimately this will be a new feature in libgit2, a "light" version of git_diff_tree_to_tree (and the corresponding function for one-versus-many-trees comparisons, do you know which function that is in libgit2?)
+
+i guess this should be implemented in a separate file next to libgit2/src/libgit2/diff_generate.c
+
+in lack of a better name, lets use libgit2/src/libgit2/diff_light_generate.c
+
+mostly i need to modify the event handlers:  
+handle_unmatched_old_item  
+handle_unmatched_new_item  
+handle_matched_item
+
+can you help me to create "light" version of these event handlers?  
+i assume that i also need "light" datastructures, for example replacing git_diff_generated with git_diff_light_generated
+
+``` c
+
+static int handle_unmatched_new_item(
+    git_diff_generated *diff, diff_in_progress *info)
+{
+    int error = 0;
+    const git_index_entry *nitem = info->nitem;
+    git_delta_t delta_type = GIT_DELTA_UNTRACKED;
+    bool contains_oitem;
+
+    /* check if this is a prefix of the other side */
+    contains_oitem = entry_is_prefixed(diff, info->oitem, nitem);
+
+    /* update delta_type if this item is conflicted */
+    if (git_index_entry_is_conflict(nitem))
+        delta_type = GIT_DELTA_CONFLICTED;
+
+    /* update delta_type if this item is ignored */
+    else if (git_iterator_current_is_ignored(info->new_iter))
+        delta_type = GIT_DELTA_IGNORED;
+
+    if (nitem->mode == GIT_FILEMODE_TREE) {
+        bool recurse_into_dir = contains_oitem;
+
+        /* check if user requests recursion into this type of dir */
+        recurse_into_dir = contains_oitem ||
+            (delta_type == GIT_DELTA_UNTRACKED &&
+             DIFF_FLAG_IS_SET(diff, GIT_DIFF_RECURSE_UNTRACKED_DIRS)) ||
+            (delta_type == GIT_DELTA_IGNORED &&
+             DIFF_FLAG_IS_SET(diff, GIT_DIFF_RECURSE_IGNORED_DIRS));
+
+        /* do not advance into directories that contain a .git file */
+        if (recurse_into_dir && !contains_oitem) {
+            git_str *full = NULL;
+            if (git_iterator_current_workdir_path(&full, info->new_iter) < 0)
+                return -1;
+            if (full && git_fs_path_contains(full, DOT_GIT)) {
+                /* TODO: warning if not a valid git repository */
+                recurse_into_dir = false;
+            }
+        }
+
+        /* still have to look into untracked directories to match core git -
+         * with no untracked files, directory is treated as ignored
+         */
+        if (!recurse_into_dir &&
+            delta_type == GIT_DELTA_UNTRACKED &&
+            DIFF_FLAG_ISNT_SET(diff, GIT_DIFF_ENABLE_FAST_UNTRACKED_DIRS))
+        {
+            git_diff_delta *last;
+            git_iterator_status_t untracked_state;
+
+            /* attempt to insert record for this directory */
+            if ((error = diff_delta__from_one(diff, delta_type, NULL, nitem)) != 0)
+                return error;
+
+            /* if delta wasn't created (because of rules), just skip ahead */
+            last = diff_delta__last_for_item(diff, nitem);
+            if (!last)
+                return iterator_advance(&info->nitem, info->new_iter);
+
+            /* iterate into dir looking for an actual untracked file */
+            if ((error = iterator_advance_over(
+                    &info->nitem, &untracked_state, info->new_iter)) < 0)
+                return error;
+
+            /* if we found nothing that matched our pathlist filter, exclude */
+            if (untracked_state == GIT_ITERATOR_STATUS_FILTERED) {
+                git_vector_pop(&diff->base.deltas);
+                git__free(last);
+            }
+
+            /* if we found nothing or just ignored items, update the record */
+            if (untracked_state == GIT_ITERATOR_STATUS_IGNORED ||
+                untracked_state == GIT_ITERATOR_STATUS_EMPTY) {
+                last->status = GIT_DELTA_IGNORED;
+
+                /* remove the record if we don't want ignored records */
+                if (DIFF_FLAG_ISNT_SET(diff, GIT_DIFF_INCLUDE_IGNORED)) {
+                    git_vector_pop(&diff->base.deltas);
+                    git__free(last);
+                }
+            }
+
+            return 0;
+        }
+
+        /* try to advance into directory if necessary */
+        if (recurse_into_dir) {
+            error = iterator_advance_into(&info->nitem, info->new_iter);
+
+            /* if directory is empty, can't advance into it, so skip it */
+            if (error == GIT_ENOTFOUND) {
+                git_error_clear();
+                error = iterator_advance(&info->nitem, info->new_iter);
+            }
+
+            return error;
+        }
+    }
+
+    else if (delta_type == GIT_DELTA_IGNORED &&
+        DIFF_FLAG_ISNT_SET(diff, GIT_DIFF_RECURSE_IGNORED_DIRS) &&
+        git_iterator_current_tree_is_ignored(info->new_iter))
+        /* item contained in ignored directory, so skip over it */
+        return iterator_advance(&info->nitem, info->new_iter);
+
+    else if (info->new_iter->type != GIT_ITERATOR_WORKDIR) {
+        if (delta_type != GIT_DELTA_CONFLICTED)
+            delta_type = GIT_DELTA_ADDED;
+    }
+
+    else if (nitem->mode == GIT_FILEMODE_COMMIT) {
+        /* ignore things that are not actual submodules */
+        if (git_submodule_lookup(NULL, info->repo, nitem->path) != 0) {
+            git_error_clear();
+            delta_type = GIT_DELTA_IGNORED;
+
+            /* if this contains a tracked item, treat as normal TREE */
+            if (contains_oitem) {
+                error = iterator_advance_into(&info->nitem, info->new_iter);
+                if (error != GIT_ENOTFOUND)
+                    return error;
+
+                git_error_clear();
+                return iterator_advance(&info->nitem, info->new_iter);
+            }
+        }
+    }
+
+    else if (nitem->mode == GIT_FILEMODE_UNREADABLE) {
+        if (DIFF_FLAG_IS_SET(diff, GIT_DIFF_INCLUDE_UNREADABLE_AS_UNTRACKED))
+            delta_type = GIT_DELTA_UNTRACKED;
+        else
+            delta_type = GIT_DELTA_UNREADABLE;
+    }
+
+    /* Actually create the record for this item if necessary */
+    if ((error = diff_delta__from_one(diff, delta_type, NULL, nitem)) != 0)
+        return error;
+
+    /* If user requested TYPECHANGE records, then check for that instead of
+     * just generating an ADDED/UNTRACKED record
+     */
+    if (delta_type != GIT_DELTA_IGNORED &&
+        DIFF_FLAG_IS_SET(diff, GIT_DIFF_INCLUDE_TYPECHANGE_TREES) &&
+        contains_oitem)
+    {
+        /* this entry was prefixed with a tree - make TYPECHANGE */
+        git_diff_delta *last = diff_delta__last_for_item(diff, nitem);
+        if (last) {
+            last->status = GIT_DELTA_TYPECHANGE;
+            last->old_file.mode = GIT_FILEMODE_TREE;
+        }
+    }
+
+    return iterator_advance(&info->nitem, info->new_iter);
+}
+
+static int handle_unmatched_old_item(
+    git_diff_generated *diff, diff_in_progress *info)
+{
+    git_delta_t delta_type = GIT_DELTA_DELETED;
+    int error;
+
+    /* update delta_type if this item is conflicted */
+    if (git_index_entry_is_conflict(info->oitem))
+        delta_type = GIT_DELTA_CONFLICTED;
+
+    if ((error = diff_delta__from_one(diff, delta_type, info->oitem, NULL)) < 0)
+        return error;
+
+    /* if we are generating TYPECHANGE records then check for that
+     * instead of just generating a DELETE record
+     */
+    if (DIFF_FLAG_IS_SET(diff, GIT_DIFF_INCLUDE_TYPECHANGE_TREES) &&
+        entry_is_prefixed(diff, info->nitem, info->oitem))
+    {
+        /* this entry has become a tree! convert to TYPECHANGE */
+        git_diff_delta *last = diff_delta__last_for_item(diff, info->oitem);
+        if (last) {
+            last->status = GIT_DELTA_TYPECHANGE;
+            last->new_file.mode = GIT_FILEMODE_TREE;
+        }
+
+        /* If new_iter is a workdir iterator, then this situation
+         * will certainly be followed by a series of untracked items.
+         * Unless RECURSE_UNTRACKED_DIRS is set, skip over them...
+         */
+        if (S_ISDIR(info->nitem->mode) &&
+            DIFF_FLAG_ISNT_SET(diff, GIT_DIFF_RECURSE_UNTRACKED_DIRS))
+            return iterator_advance(&info->nitem, info->new_iter);
+    }
+
+    return iterator_advance(&info->oitem, info->old_iter);
+}
+
+static int handle_matched_item(
+    git_diff_generated *diff, diff_in_progress *info)
+{
+    int error = 0;
+
+    if ((error = maybe_modified(diff, info)) < 0)
+        return error;
+
+    if (!(error = iterator_advance(&info->oitem, info->old_iter)))
+        error = iterator_advance(&info->nitem, info->new_iter);
+
+    return error;
+}
+```
+
+## Response:
+
+6/19/2026, 5:25:17 PM
+
+Yes. I think your direction is right: **do not build path→oid maps**, and do not call `git_diff_tree_to_tree()` and throw away 99% of the work. The libgit2 iterator machinery already gives you the optimal thing: a **streaming sorted N-way merge over trees**.
+
+A "light" diff should probably live beside `diff_generate.c` and reuse:
+
+- `git_iterator_for_tree`
+- `iterator_current`
+- `iterator_advance`
+- `iterator_advance_into`
+- `entry_is_prefixed`
+
+but replace:
+
+- `git_diff_generated`
+- `diff_in_progress`
+- `diff_delta__from_one`
+- `maybe_modified`
+
+with tiny structures.
+
+The key observation:
+
+For your use case you do **not care about deleted files** (because you are walking backwards from HEAD and only need the first introduction/change of a blob). You only need:
+
+- current tree entry exists
+- no parent tree has same blob at same path
+- emit "changed path"
+
+So the "light" event handlers can be much smaller.
+
+Something like:
+
+``` c
+typedef struct {
+    const char *path;
+    git_oid oid;
+    git_filemode_t mode;
+} git_diff_light_entry;
+
+typedef struct {
+    git_iterator *iter;
+    const git_index_entry *item;
+} light_iter_state;
+
+typedef struct {
+    git_repository *repo;
+
+    /* current commit tree */
+    git_iterator *current_iter;
+
+    /* parents */
+    size_t parent_count;
+    git_iterator **parent_iters;
+
+    /*
+     * callback called when a path is new/changed
+     */
+    int (*cb)(
+        const char *path,
+        const git_oid *oid,
+        void *payload);
+
+    void *payload;
+
+} git_diff_light_generated;
+```
+
+Now the important part:
+
+## N-way matched/unmatched logic
+
+Instead of:
+
+    old
+     |
+     +---- compare ---- new
+
+you want:
+
+    parent0
+    parent1
+    parent2
+    ...
+    current
+
+           |
+           v
+
+         minimum path
+
+Like git's internal iterator merge, but N-way.
+
+Pseudo:
+
+``` c
+while (some iterator has item)
+{
+    smallest = iterator with smallest path;
+
+    path = smallest.path;
+
+current_item = current iterator if same path;
+
+bool exists_in_parent = false;
+
+    for each parent iterator:
+        if parent.path == path:
+            if oid_equal(parent.oid, current.oid):
+                 exists_in_parent = true;
+
+if current exists:
+
+        if !exists_in_parent:
+            emit(current.path,current.oid)
+
+advance every iterator with this path
+}
+```
+
+This gives you:
+
+- no recursion into identical trees
+- no hashing
+- no allocations
+- no path maps
+- O(changed files × log(parents))
+
+------------------------------------------------------------------------
+
+### The "light" equivalent of `handle_matched_item`
+
+Your version:
+
+``` c
+static int light_handle_matched(
+    git_diff_light_generated *diff,
+    light_iter_state *cur,
+    light_iter_state *parent)
+{
+    if (!git_oid_equal(
+            &cur->item->id,
+            &parent->item->id))
+    {
+        return diff->cb(
+            cur->item->path,
+            &cur->item->id,
+            diff->payload);
+    }
+
+    return 0;
+}
+```
+
+No delta creation.
+
+------------------------------------------------------------------------
+
+### light `handle_unmatched_new_item`
+
+This is the interesting one.
+
+When a path exists only in current:
+
+``` c
+static int light_handle_unmatched_new(
+    git_diff_light_generated *diff,
+    const git_index_entry *item)
+{
+    return diff->cb(
+        item->path,
+        &item->id,
+        diff->payload);
+}
+```
+
+Because it cannot exist in any parent iterator at this path.
+
+------------------------------------------------------------------------
+
+### light `handle_unmatched_old_item`
+
+For file times you can literally ignore it:
+
+``` c
+static int light_handle_unmatched_old(
+    git_diff_light_generated *diff,
+    const git_index_entry *item)
+{
+    return 0;
+}
+```
+
+Deleted files do not introduce a blob.
+
+------------------------------------------------------------------------
+
+## The recursion optimization
+
+This is the part where you are correct:
+
+> N-way tree walking is faster, because we don't have to recurse into identical subtrees
+
+Yes.
+
+Do **not** do:
+
+    lookup(parent tree)
+    lookup(current tree)
+    walk children
+
+Instead, when the iterator gives you:
+
+    parent:
+    src/ tree oid A
+
+    current:
+    src/ tree oid A
+
+you simply advance both.
+
+The iterator already has the optimization:
+
+    tree oid equal?
+    skip subtree
+
+You want to preserve that.
+
+------------------------------------------------------------------------
+
+## For your git-file-times case
+
+Your callback becomes:
+
+``` c
+static int found_change(
+    const char *path,
+    const git_oid *oid,
+    void *payload)
+{
+    Context *ctx = payload;
+
+    auto it = ctx->blobs.find(*oid);
+
+    if (it != ctx->blobs.end() &&
+        !it->second.has_time)
+    {
+        it->second.time = ctx->time;
+        it->second.has_time=true;
+        ctx->num_remaining--;
+    }
+
+    return 0;
+}
+```
+
+Then the whole algorithm becomes:
+
+    for commit in revwalk:
+        current tree iterator
+        parent tree iterators
+
+        git_diff_light_tree_to_trees()
+
+No special merge handling.
+
+------------------------------------------------------------------------
+
+One thing I would **not** do yet: oid→path rename detection.
+
+Git does rename detection after diff generation (`diffcore-rename`). It is a separate expensive phase. For file timestamps, blob identity is enough. If you later add rename support, do it as an optional second pass.
+
+The nice thing: this "light diff" API could actually be a useful libgit2 feature. It is basically:
+
+    git_diff_tree_to_tree()
+           |
+           +-- full diff generator
+           |
+           +-- light tree change iterator
+
+and your use case is exactly the kind of thing where full diff is wasteful.
+
+## Prompt:
+
+6/19/2026, 5:38:31 PM
+
+> ### light `handle_unmatched_old_item`
+>
+> For file times you can literally ignore it:
+
+but i have to track deletions, so then i can track renames.  
+rename = file X was deleted from path A + file X was added to path B
+
+## Response:
+
+6/19/2026, 5:38:36 PM
+
+Yes — good catch. My previous "ignore unmatched old items" idea was too aggressive. For your use case, **deletions are not just noise**: they are one half of rename detection.
+
+Your "light diff" is actually closer to Git's internal **tree change detector**, not just "find modified files". You want:
+
+- `ADDED(path, oid)`
+- `DELETED(path, oid)`
+- `MODIFIED(path, old_oid, new_oid)`
+- maybe `RENAMED(old_path, new_path, oid)` later
+
+and you can derive rename:
+
+    deleted:  oid=X path=A
+    added:    oid=X path=B
+
+    => rename A -> B
+
+So your light handlers should still emit events, but skip all the expensive stuff:
+
+- no patch generation
+- no similarity calculation
+- no workdir/index logic
+- no submodule checks
+- no ignore handling
+- no content loading
+
+------------------------------------------------------------------------
+
+## Proposed data structures
+
+Something like:
+
+``` c
+typedef enum {
+    GIT_DELTA_LIGHT_ADDED,
+    GIT_DELTA_LIGHT_DELETED,
+    GIT_DELTA_LIGHT_MODIFIED,
+} git_delta_light_t;
+
+typedef struct {
+    git_delta_light_t status;
+
+    git_oid old_oid;
+    git_oid new_oid;
+
+    const char *old_path;
+    const char *new_path;
+
+    int old_mode;
+    int new_mode;
+} git_diff_light_delta;
+
+typedef struct {
+    git_repository *repo;
+
+    git_vector deltas;
+
+    git_iterator *old_iter;
+    git_iterator *new_iter;
+
+    git_diff_options opts;
+
+} git_diff_light_generated;
+```
+
+You probably want your own vector type because `git_diff_delta` has a lot of baggage.
+
+------------------------------------------------------------------------
+
+## light handle_unmatched_old_item
+
+This is basically just:
+
+``` c
+static int light_handle_unmatched_old_item(
+    git_diff_light_generated *diff,
+    diff_in_progress *info)
+{
+    git_diff_light_delta *delta;
+
+    delta = git__calloc(1, sizeof(*delta));
+    GIT_ERROR_CHECK_ALLOC(delta);
+
+delta->status = GIT_DELTA_LIGHT_DELETED;
+
+    git_oid_cpy(
+        &delta->old_oid,
+        &info->oitem->id
+    );
+
+    delta->old_path = git__strdup(
+        info->oitem->path
+    );
+
+git_vector_insert(
+        &diff->deltas,
+        delta
+    );
+
+return iterator_advance(
+        &info->oitem,
+        info->old_iter
+    );
+}
+```
+
+This is the important rename half.
+
+------------------------------------------------------------------------
+
+## light handle_unmatched_new_item
+
+Same idea:
+
+``` c
+static int light_handle_unmatched_new_item(
+    git_diff_light_generated *diff,
+    diff_in_progress *info)
+{
+    git_diff_light_delta *delta;
+
+    delta = git__calloc(1, sizeof(*delta));
+    GIT_ERROR_CHECK_ALLOC(delta);
+
+delta->status = GIT_DELTA_LIGHT_ADDED;
+
+git_oid_cpy(
+        &delta->new_oid,
+        &info->nitem->id
+    );
+
+    delta->new_path = git__strdup(
+        info->nitem->path
+    );
+
+git_vector_insert(
+        &diff->deltas,
+        delta
+    );
+
+return iterator_advance(
+        &info->nitem,
+        info->new_iter
+    );
+}
+```
+
+------------------------------------------------------------------------
+
+## light handle_matched_item
+
+This is the interesting one.
+
+The normal git code calls:
+
+``` c
+maybe_modified()
+```
+
+which is expensive because it may:
+
+- stat files
+- compare sizes
+- load blobs
+- generate patches
+
+You only need oid comparison:
+
+``` c
+static int light_handle_matched_item(
+    git_diff_light_generated *diff,
+    diff_in_progress *info)
+{
+    if (!git_oid_equal(
+            &info->oitem->id,
+            &info->nitem->id))
+    {
+        git_diff_light_delta *delta;
+
+        delta = git__calloc(1, sizeof(*delta));
+        GIT_ERROR_CHECK_ALLOC(delta);
+
+delta->status =
+            GIT_DELTA_LIGHT_MODIFIED;
+
+git_oid_cpy(
+            &delta->old_oid,
+            &info->oitem->id
+        );
+
+        git_oid_cpy(
+            &delta->new_oid,
+            &info->nitem->id
+        );
+
+delta->old_path =
+            git__strdup(info->oitem->path);
+
+        delta->new_path =
+            git__strdup(info->nitem->path);
+
+git_vector_insert(
+            &diff->deltas,
+            delta
+        );
+    }
+
+int error;
+
+    if ((error = iterator_advance(
+            &info->oitem,
+            info->old_iter)) < 0)
+        return error;
+
+return iterator_advance(
+        &info->nitem,
+        info->new_iter);
+}
+```
+
+------------------------------------------------------------------------
+
+## Then your rename detection is trivial
+
+After the walk:
+
+``` c
+for each deleted delta:
+    find added delta with same oid
+
+    if found:
+        rename
+```
+
+You can accelerate this:
+
+``` c
+unordered_map<git_oid, deleted_delta> deleted;
+unordered_map<git_oid, added_delta> added;
+```
+
+------------------------------------------------------------------------
+
+## For merge commits
+
+The nice thing: you do **not** need a special merge version.
+
+The N-way logic sits above this.
+
+Conceptually:
+
+                 parent1
+                    |
+                    v
+    parent2 ---> current
+                    ^
+                    |
+                 parent3
+
+You compute:
+
+    current vs union(parents)
+
+Where:
+
+    old_oid = first matching parent oid
+
+and:
+
+    if current oid exists in any parent:
+            not added
+    else:
+            added
+
+So your existing iterator walk idea is still right.
+
+------------------------------------------------------------------------
+
+## One more optimization idea
+
+Your instinct about caching trees is correct.
+
+But I would not cache:
+
+    path -> oid
+
+because libgit2's tree iterator already gives you:
+
+    sorted path stream
+
+The expensive part is walking identical subtrees.
+
+For this, the right cache key is:
+
+    tree_oid -> flattened iterator result
+
+Example:
+
+    a/b/c subtree oid = abc123
+
+    cache:
+    abc123 ->
+    [
+      a/b/c/file1 oid=x,
+      a/b/c/file2 oid=y
+    ]
+
+Then when the same subtree appears in parent and child commits:
+
+    same tree oid
+        |
+        +-- skip entirely
+
+This is basically what Git's tree diff machinery exploits.
+
+------------------------------------------------------------------------
+
+So I think your architecture should be:
+
+    diff_light_generate.c
+
+    tree iterators
+          |
+          v
+    N-way merge walker
+          |
+          +-- light_handle_added()
+          +-- light_handle_deleted()
+          +-- light_handle_modified()
+          |
+          v
+    (change list)
+          |
+          +-- rename detector
+          |
+          v
+    file timestamp resolver
+
+That avoids reinventing Git's diff engine while keeping only the information you need. This is probably within a few multiples of Git's own speed.
+
+## Prompt:
+
+6/20/2026, 8:37:43 AM
+
+stupid question:  
+how does "git log -- somefile" solve this problem?  
+i assume that "git log" does not compute diffs of trees, but i assume that "git log" has a more efficient way to track changes in a file. in my old "reference implementation" i was using  
+`git ls-files -z | xargs -0 -I{} -- git log --follow --diff-filter=ACM -1 --format="%ct {}" {}`  
+but that failed to return merge commits where the file was modified in the merge commit  
+so i guess i can re-use the "git log" machinery, and i only need to fix the case where files are modified in merge commits, and instead of tracking only one file, i want to track all files in the HEAD commit...
+
+## Response:
+
+6/20/2026, 8:37:48 AM
+
+Not a stupid question at all. In fact, it gets to the heart of why your current approach feels like reimplementing half of Git.
+
+The surprising answer is:
+
+> `git log -- file` absolutely *does* compute tree differences.
+
+It just does it lazily and only for the paths it cares about.
+
+------------------------------------------------------------------------
+
+## How `git log -- file3.txt` works
+
+When Git walks commits:
+
+``` bash
+git log -- file3.txt
+```
+
+it doesn't ask:
+
+> "What changed in this commit?"
+
+Instead it asks:
+
+> "Did this commit affect file3.txt?"
+
+Those are very different questions.
+
+For every commit it compares:
+
+``` text
+parent tree
+vs
+current tree
+```
+
+but only for the path:
+
+``` text
+file3.txt
+```
+
+not for the whole tree.
+
+So complexity is roughly:
+
+``` text
+O(commits × log(tree_size))
+```
+
+instead of
+
+``` text
+O(commits × tree_size)
+```
+
+because Git can descend directly through tree objects:
+
+``` text
+root
+ ├─ src
+ │   ├─ foo.c
+ │   └─ bar.c
+ └─ file3.txt
+```
+
+and only looks at the entries necessary to find `file3.txt`.
+
+------------------------------------------------------------------------
+
+## Why it is fast
+
+Suppose a repo has
+
+``` text
+1,000,000 files
+```
+
+and you're tracking
+
+``` text
+file3.txt
+```
+
+Git does not enumerate the million files.
+
+It walks:
+
+``` text
+root tree
+ -> find "file3.txt"
+```
+
+using sorted tree entries.
+
+For a merge commit it checks:
+
+``` text
+parent1:file3.txt
+parent2:file3.txt
+current:file3.txt
+```
+
+and decides whether the path changed.
+
+------------------------------------------------------------------------
+
+## What --follow does
+
+This is even more interesting.
+
+``` bash
+git log --follow file3.txt
+```
+
+is not a graph algorithm.
+
+It is basically:
+
+``` text
+look at commit
+if path disappeared:
+    run rename detection
+    find predecessor path
+continue with predecessor path
+```
+
+Rename detection is only run when needed.
+
+Git does NOT maintain a rename graph in the repository.
+
+------------------------------------------------------------------------
+
+## Why your problem is different
+
+Your goal is:
+
+> For every blob in HEAD, find the newest commit that introduced that blob into the current history.
+
+That's the reverse of what git log does.
+
+Git log starts with:
+
+``` text
+path
+```
+
+and searches history.
+
+You start with:
+
+``` text
+HEAD tree
+```
+
+and want timestamps for every path.
+
+So if HEAD contains:
+
+``` text
+100000 files
+```
+
+running
+
+``` bash
+git log -- path
+```
+
+100000 times is absurd.
+
+That's why you're trying to do a single reverse walk.
+
+------------------------------------------------------------------------
+
+## What Git itself does for blame
+
+Your problem is actually much closer to:
+
+``` bash
+git blame
+```
+
+than to
+
+``` bash
+git log
+```
+
+Blame starts from:
+
+``` text
+HEAD version of file
+```
+
+and walks backwards until every line is explained.
+
+Your algorithm is:
+
+``` text
+HEAD version of tree
+```
+
+and walk backwards until every blob is explained.
+
+Conceptually they're very similar.
+
+------------------------------------------------------------------------
+
+## Looking at your failing example
+
+You found:
+
+``` text
+merge commit 8a40c6f
+```
+
+copied:
+
+``` text
+file3.txt
+```
+
+from the right parent.
+
+Therefore:
+
+``` text
+8a40c6f
+```
+
+did NOT modify file3.txt.
+
+But your algorithm recorded:
+
+``` text
+file3.txt -> 8a40c6f
+```
+
+because it compared only against parent \#1.
+
+That's exactly the mistake Git avoids.
+
+Git asks:
+
+``` text
+Does current blob equal any parent blob?
+```
+
+If yes:
+
+``` text
+file unchanged in merge
+```
+
+If no:
+
+``` text
+file modified by merge
+```
+
+------------------------------------------------------------------------
+
+## The key optimization
+
+You do **not** want:
+
+``` text
+compare current tree against all parent trees
+```
+
+for every commit.
+
+Instead:
+
+For each file appearing in the current tree:
+
+``` text
+current blob oid
+```
+
+ask:
+
+``` text
+does any parent have the same blob at this path?
+```
+
+If yes:
+
+``` text
+unchanged
+```
+
+If no:
+
+``` text
+changed
+```
+
+That is exactly the logic you already added:
+
+``` cpp
+tree_contains_blob_at_path(parent_tree, path, coid)
+```
+
+The problem is that doing that via
+
+``` cpp
+git_tree_entry_bypath()
+```
+
+for every file and every parent becomes expensive.
+
+------------------------------------------------------------------------
+
+## What I would steal from Git
+
+If you're planning a libgit2 feature anyway, I'd build something like:
+
+``` c
+git_tree_change_iterator
+```
+
+internally based on the iterator machinery already used by:
+
+``` c
+git_diff__from_iterators()
+```
+
+but instead of generating:
+
+``` c
+git_diff_delta
+```
+
+objects, generate:
+
+``` c
+struct git_tree_change {
+    const char *path;
+
+    git_oid old_oid;
+    git_oid new_oid;
+
+    bool added;
+    bool deleted;
+    bool modified;
+};
+```
+
+No patch generation.  
+No similarity index.  
+No rename detection.  
+No delta allocation.
+
+Just tree walking.
+
+------------------------------------------------------------------------
+
+## Even more aggressive
+
+For your specific use case:
+
+``` text
+HEAD blobs
+↓
+reverse walk commits
+↓
+stop once all blobs have timestamps
+```
+
+you don't even need a diff output.
+
+You only need:
+
+``` text
+"is this HEAD blob explained by this commit?"
+```
+
+So a specialized libgit2 routine could be:
+
+``` c
+git_tree_find_introduced_blobs(...)
+```
+
+which walks trees and invokes:
+
+``` c
+callback(path, blob_oid)
+```
+
+for additions/modifications.
+
+That would be much cheaper than constructing any diff structure.
+
+------------------------------------------------------------------------
+
+So I think you've arrived at the same conclusion Git developers arrived at years ago:
+
+- `git log -- path` is fast because it tracks a small number of paths.
+- Your problem is "all HEAD paths simultaneously".
+- The closest existing Git machinery is actually the diff iterator engine (`git_iterator`) and blame-like reverse history traversal.
+- A lightweight version of `git_diff__from_iterators()` that emits only add/delete/modify events (and maybe rename candidates) is probably the right abstraction for a future libgit2 implementation.
+
+## Prompt:
+
+6/20/2026, 5:25:34 PM
+
+currently i am back to trying to silve this downstream of libgit2 in my own C++ code... challenges:
+
+1.  i want to avoid recursion, so i need some kind of stack processing (or...?)
+2.  i need to process an arbitrary number of "current" trees in parallel, comparing teach current tree to an arbitrary number of parent trees, with arbitrary levels of recursion......
+
+this problem is starting to grow too big for my brain.... maybe you have some radically genius idea to make this a bit simpler?
+
+here is my current mess, trying to handle an arbitrary number of parent trees, but still handling only one current tree.... this is mostly a copy-paste of my old compare_tree function....
+
+``` cpp
+
+static void compare_tree_merge_2(
+    git_tree *current,
+    const std::string &current_root,
+    Context *ctx)
+{
+    const size_t current_n = git_tree_entrycount(current);
+
+    // if (DEBUG) {
+    //     std::cerr << "560: walking " << current_n << " tree entries\n";
+    // }
+
+    // merge walk current tree and all parent trees
+
+    size_t num_parents = ctx->parent_trees.size();
+
+    // parent tree indices
+    std::vector<size_t> ps;
+    ps.reserve(num_parents);
+    for (size_t pi = 0; pi < num_parents; pi++) {
+        ps[pi] = 0;
+    }
+
+    // walk current tree
+    for (size_t c = 0; c < current_n; ++c)
+    {
+        const git_tree_entry *ce = git_tree_entry_byindex(current, c);
+        git_object_t ctype = git_tree_entry_type(ce);
+        const char *cname = git_tree_entry_name(ce);
+        const git_oid *coid = git_tree_entry_id(ce);
+
+        // find entry by name in all parent trees
+        for (size_t pi = 0; pi < num_parents; pi++) {
+            git_tree *parent = ctx->parent_trees[pi];
+            size_t p = ps[pi];
+            const git_tree_entry *pe = git_tree_entry_byindex(parent, p);
+            // git_object_t ptype = git_tree_entry_type(pe);
+            // const char *pname = git_tree_entry_name(pe);
+
+            // copy-paste from compare_tree
+            int cmp;
+            if (!pe) {
+                // end of parent tree
+                if (DEBUG) {
+                    std::cerr << "270: end of parent tree -> cmp=+1\n";
+                }
+                cmp = +1; // entry name exists only in current tree
+            }
+            // this is impossible. ce is never nullptr
+            // else if (!ce) {
+            //     // end of current tree
+            //     if (DEBUG) {
+            //         std::cerr << "280: end of current tree -> break\n";
+            //     }
+            //     // cmp = -1; // entry name exists only in parent tree
+            //     break;
+            // }
+            else {
+                // found parent and current entry
+                // compare entry names
+                cmp = strcmp(
+                    git_tree_entry_name(pe), // pname
+                    // git_tree_entry_name(ce)
+                    cname
+                );
+                // note: git_tree_entry_name does not return
+                // slash-suffixed names for tree entries
+                // std::cerr << "p_name=" << git_tree_entry_name(pe) << "\n";
+                // std::cerr << "c_name=" << git_tree_entry_name(ce) << "\n";
+
+                if (DEBUG) {
+                    std::cerr
+                        << "300: pe.name=" << (pe ? git_tree_entry_name(pe) : "<null>")
+                        << " ce.name=" << (ce ? git_tree_entry_name(ce) : "<null>")
+                        << " cmp=" << cmp
+                        << "\n";
+                }
+            }
+
+            if (cmp == 0) {
+                // same entry name in parent and current tree
+                if (DEBUG) {
+                    std::cerr << "310: cmp=0: same entry name: " << git_tree_entry_name(pe) << "\n";
+                }
+                // compare entry contents
+                auto ptype = git_tree_entry_type(pe);
+                // auto ctype = git_tree_entry_type(ce);
+                if (ptype == GIT_OBJECT_BLOB && ctype == GIT_OBJECT_BLOB)
+                {
+                    // compare blob contents
+                    const git_oid *poid = git_tree_entry_id(pe);
+                    // const git_oid *coid = git_tree_entry_id(ce);
+
+                    if (DEBUG && strcmp(git_tree_entry_name(ce), "ci.nix") == 0) {
+                        auto it = ctx->blobs.find(*coid);
+                        std::cerr
+                            << "320: ci.nix poid="
+                            << git_oid_tostr_s(poid)
+                            << " -> coid="
+                            << git_oid_tostr_s(coid)
+                            << " equal=" << git_oid_equal(poid, coid)
+                            << " in_head=" << (it != ctx->blobs.end())
+                            << "\n";
+                    }
+
+                    if (!git_oid_equal(poid, coid)) {
+                        // blob changed in this commit
+                        auto it = ctx->blobs.find(*coid);
+                        if (it != ctx->blobs.end()) {
+                            // std::string path = join_paths_3(ctx->tree_root, current_root, git_tree_entry_name(ce));
+                            std::string path = join_paths_3(ctx->tree_root, "", git_tree_entry_name(ce));
+                            if (!it->second.has_time) {
+                                if (DEBUG)
+                                    std::cerr << "340: setting time: path=" << path
+                                        << " time=" << ctx->time
+                                        << " commit=" << git_oid_tostr_s(ctx->oid)
+                                        << "\n";
+                                it->second.time = ctx->time;
+                                it->second.has_time = true;
+                                ctx->num_remaining--;
+                                ctx->files_found++;
+                            }
+                            else {
+                                if (DEBUG)
+                                    std::cerr << "350: not setting time: path=" << path
+                                        << " time=" << ctx->time
+                                        << " commit=" << git_oid_tostr_s(ctx->oid)
+                                        << "\n";
+                            }
+                        }
+                    }
+                }
+                else if (ptype == GIT_OBJECT_TREE && ctype == GIT_OBJECT_TREE)
+                {
+                    // compare tree contents
+                    const git_oid *poid = git_tree_entry_id(pe);
+                    // const git_oid *coid = git_tree_entry_id(ce);
+                    if (!git_oid_equal(poid, coid)) {
+                        git_tree *ptree = nullptr;
+                        git_tree *ctree = nullptr;
+                        git_tree_lookup(&ptree, ctx->repo, poid);
+                        git_tree_lookup(&ctree, ctx->repo, coid);
+                        // FIXME avoid recursion
+                        // recursion
+                        std::string proot = parent_root + "/" + git_tree_entry_name(pe);
+                        // std::string croot = parent_root + "/" + git_tree_entry_name(ce);
+                        std::string croot = current_root + "/" + git_tree_entry_name(ce);
+                        compare_tree(ptree, ctree, proot, croot, ctx);
+                        // free memory
+                        git_tree_free(ptree);
+                        git_tree_free(ctree);
+                    }
+                }
+                // else: file type was changed. TODO what now?
+                ++p;
+                ++ps[pi];
+                // ++c;
+            }
+            else if (cmp == -1) {
+                // entry name exists only in parent tree
+                if (DEBUG) {
+                    std::cerr << "390: cmp=-1: entry name only in parent tree: " << git_tree_entry_name(pe) << "\n";
+                }
+                // entry was removed in current commit
+                // FIXME maybe entry was renamed
+                ++p;
+                ++ps[pi];
+            }
+            else { // cmp == +1
+                // entry name exists only in current tree
+                if (DEBUG) {
+                    std::cerr << "400: cmp=+1: entry name only in current tree: " << git_tree_entry_name(ce) << "\n";
+                }
+                // entry was added in current commit
+                // FIXME maybe entry was renamed
+                auto ctype = git_tree_entry_type(ce);
+                if (ctype == GIT_OBJECT_BLOB)
+                {
+                    // blob was added in current commit
+                    const git_oid *coid = git_tree_entry_id(ce);
+                    auto it = ctx->blobs.find(*coid);
+                    if (it != ctx->blobs.end()) {
+                        // std::string path = join_paths_3(ctx->tree_root, current_root, git_tree_entry_name(ce));
+                        std::string path = join_paths_3(ctx->tree_root, "", git_tree_entry_name(ce));
+                        // if (!it->second.has_time) {
+                        //     if (DEBUG)
+                        //         std::cerr << "410: setting time: path=" << path
+                        //             << " time=" << ctx->time
+                        //             << " commit=" << git_oid_tostr_s(ctx->oid)
+                        //             << "\n";
+                        //     it->second.time = ctx->time;
+                        //     it->second.has_time = true;
+                        //     ctx->num_remaining--;
+                        //     ctx->files_found++;
+                        // }
+                        // else {
+                        //     if (DEBUG)
+                        //         std::cerr << "420: not setting time: path=" << path
+                        //             << " time=" << ctx->time
+                        //             << " commit=" << git_oid_tostr_s(ctx->oid)
+                        //             << "\n";
+                        // }
+
+                        bool existed_in_parent = false;
+
+                        if (ctx->is_merge)
+                        {
+                            if (DEBUG) {
+                                std::cerr << "440: is_merge=true\n";
+                            }
+                            for (auto *parent_tree : ctx->parent_trees)
+                            {
+                                if (tree_contains_blob_at_path(parent_tree, path, coid, ctx))
+                                {
+                                    existed_in_parent = true;
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (DEBUG) {
+                                std::cerr << "450: is_merge=false\n";
+                            }
+                            existed_in_parent = tree_contains_blob_at_path(parent, path, coid, ctx);
+                        }
+
+                        if (!existed_in_parent)
+                        {
+                            if (DEBUG)
+                                std::cerr << "460: existed_in_parent=false -> setting time: path=" << path
+                                    << " time=" << ctx->time
+                                    << " commit=" << git_oid_tostr_s(ctx->oid)
+                                    << "\n";
+
+                            it->second.time = ctx->time;
+                            it->second.has_time = true;
+                            ctx->num_remaining--;
+                            ctx->files_found++;
+                        }
+                        else
+                        {
+                            if (DEBUG)
+                                std::cerr << "470: existed_in_parent=true -> not setting time: path=" << path
+                                    << " time=" << ctx->time
+                                    << " commit=" << git_oid_tostr_s(ctx->oid)
+                                    << "\n";
+                        }
+                    }
+                }
+                // TODO remove
+                // else if (ctype == GIT_OBJECT_TREE)
+                else if (false)
+                {
+                    // tree was added in current commit
+                    const git_oid *coid = git_tree_entry_id(ce);
+                    git_tree *ctree = nullptr;
+                    git_tree_lookup(&ctree, ctx->repo, coid);
+                    assert(ctree != nullptr);
+                    ctx->tree_root = join_paths_3(current_root, "", git_tree_entry_name(ce));
+                    git_tree_walk(
+                        ctree,
+                        GIT_TREEWALK_PRE,
+                        [](const char *root,
+                        const git_tree_entry *entry,
+                        void *payload) -> int
+                        {
+                            auto *ctx =
+                                static_cast<Context*>(payload);
+
+                            if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
+                                return 0;
+
+                            const git_oid *oid = git_tree_entry_id(entry);
+                            if (!oid)
+                                return 0;
+
+                            // entry was added in current commit
+                            auto it = ctx->blobs.find(*oid);
+                            if (it != ctx->blobs.end()) {
+                                std::string path = join_paths_3(ctx->tree_root, root, git_tree_entry_name(entry));
+                                if (!it->second.has_time) {
+                                    if (DEBUG)
+                                        std::cerr << "510: setting time: path=" << path
+                                            << " time=" << ctx->time
+                                            << " commit=" << git_oid_tostr_s(ctx->oid)
+                                            << "\n";
+                                    it->second.time = ctx->time;
+                                    it->second.has_time = true;
+                                    ctx->num_remaining--;
+                                    ctx->files_found++;
+                                }
+                                else {
+                                    if (DEBUG)
+                                        std::cerr << "520: not setting time: path=" << path
+                                            << " time=" << ctx->time
+                                            << " commit=" << git_oid_tostr_s(ctx->oid)
+                                            << "\n";
+                                }
+                            }
+
+                            return 0;
+                        },
+                        ctx
+                    );
+                    ctx->tree_root = current_root;
+                }
+                else if (ctype == GIT_OBJECT_TREE)
+                {
+                    // compare tree contents
+                    const git_oid *coid = git_tree_entry_id(ce);
+                    git_tree *ctree = nullptr;
+                    git_tree_lookup(&ctree, ctx->repo, coid);
+                    // FIXME avoid recursion
+                    // recursion
+                    // std::string croot = parent_root + "/" + git_tree_entry_name(ce);
+                    std::string croot = current_root + "/" + git_tree_entry_name(ce);
+                    compare_tree(nullptr, ctree, "", croot, ctx);
+                    // free memory
+                    git_tree_free(ctree);
+                }
+                // ++c;
+            }
+        }
+
+        if (ctype == GIT_OBJECT_BLOB)
+        {
+            const git_oid *coid =
+                git_tree_entry_id(ce);
+
+            std::string path =
+                join_paths_3( current_root, "", cname);
+
+            // TODO continue if has_time==true for this file
+
+            // if (DEBUG) {
+            //     std::cerr << "580: ce.path=" << path << "\n";
+            // }
+
+            // std::cerr << "590: searching path in " << num_parents << " parent trees\n";
+            bool existed_in_any_parent = false;
+
+            // walk parent trees
+            int parent_tree_idx = -1;
+            for (auto *parent_tree : ctx->parent_trees)
+            {
+                parent_tree_idx++;
+                if (DEBUG) {
+                    // std::cerr << "590: searching path in parent tree " << parent_tree_idx << "\n";
+                }
+                // FIXME this is slow
+                if (tree_contains_blob_at_path(parent_tree, path, coid, ctx))
+                {
+                    existed_in_any_parent = true;
+                    // if (DEBUG) {
+                    //     std::cerr << "590: found path in parent tree " << parent_tree_idx << "\n";
+                    // }
+                    break;
+                }
+            }
+
+            if (!existed_in_any_parent)
+            {
+                if (DEBUG) {
+                    std::cerr << "590: not found path in any parent tree\n";
+                }
+
+                auto it = ctx->blobs.find(*coid);
+
+                if (it != ctx->blobs.end())
+                {
+                    if (!it->second.has_time)
+                    {
+                        if (DEBUG)
+                        {
+                            std::cerr
+                                << "merge: setting time: path="
+                                << path
+                                << " time="
+                                << ctx->time
+                                << " commit="
+                                << git_oid_tostr_s(ctx->oid)
+                                << "\n";
+                        }
+
+                        it->second.time = ctx->time;
+                        it->second.has_time = true;
+                        ctx->num_remaining--;
+                        ctx->files_found++;
+                    }
+                }
+            }
+        }
+        else if (ctype == GIT_OBJECT_TREE)
+        {
+            git_tree *ctree = nullptr;
+
+            git_tree_lookup(
+                &ctree,
+                ctx->repo,
+                git_tree_entry_id(ce));
+
+            std::string croot =
+                join_paths_3(
+                    current_root,
+                    "",
+                    git_tree_entry_name(ce));
+
+            // recursion
+            // FIXME avoid recursion
+            compare_tree_merge_2(
+                ctree,
+                croot,
+                ctx);
+
+            git_tree_free(ctree);
+        }
+    }
+}
+```
+
+## Response:
+
+6/20/2026, 5:25:39 PM
+
+I think you're still thinking too much in terms of "compare current tree against parent trees".
+
+Your actual problem is:
+
+> Walk N sorted trees simultaneously and detect whether a blob in the current tree is new relative to all parents.
+
+That's closer to libgit2's iterator machinery than to recursive tree diffs.
+
+The thing that jumps out from your code is that you're repeatedly doing:
+
+``` cpp
+tree_contains_blob_at_path(parent_tree, path, coid, ctx)
+```
+
+which is effectively:
+
+``` cpp
+git_tree_entry_bypath(...)
+```
+
+for every file.
+
+That's O(files × parents × log(tree_size)) or worse.
+
+The reason your performance collapsed is that you lost the linear merge-walk property of your original code.
+
+------------------------------------------------------------------------
+
+## Radical simplification
+
+Forget recursion.
+
+Represent the work as a stack of frames:
+
+``` cpp
+struct Frame {
+    git_tree *current;
+
+    std::vector<git_tree*> parents;
+
+    std::string root;
+
+    size_t current_idx;
+
+    std::vector<size_t> parent_idx;
+};
+```
+
+Then:
+
+``` cpp
+std::vector<Frame> stack;
+```
+
+Start with:
+
+``` cpp
+stack.push_back({
+    current_tree,
+    parent_trees,
+    "",
+    0,
+    std::vector<size_t>(parent_trees.size(), 0)
+});
+```
+
+Now perform iterative DFS:
+
+``` cpp
+while (!stack.empty())
+{
+    Frame &f = stack.back();
+
+    ...
+}
+```
+
+No recursion anywhere.
+
+------------------------------------------------------------------------
+
+## More important: N-way merge walk
+
+The key idea:
+
+Every tree is sorted.
+
+For a current entry:
+
+``` cpp
+ce = current[current_idx]
+```
+
+you should advance every parent cursor until:
+
+``` cpp
+parent_name >= current_name
+```
+
+exactly like merging sorted arrays.
+
+Pseudo:
+
+``` cpp
+for each parent i:
+
+    while (parent_idx[i] < parent_n)
+    {
+        pe = parent[parent_idx[i]]
+
+        cmp = strcmp(pe->name, ce->name)
+
+        if (cmp < 0)
+        {
+            parent_idx[i]++
+            continue
+        }
+
+        break
+    }
+```
+
+Then parent cursor is positioned at:
+
+- matching name
+- larger name
+- end of tree
+
+No path lookup required.
+
+No hash map required.
+
+No bypath required.
+
+Linear.
+
+------------------------------------------------------------------------
+
+## Then classify current entry
+
+For blob:
+
+``` cpp
+bool same_blob_in_parent = false;
+
+for each parent i
+{
+    if (name matches &&
+        type matches &&
+        oid matches)
+    {
+        same_blob_in_parent = true;
+        break;
+    }
+}
+```
+
+If true:
+
+``` cpp
+skip
+```
+
+If false:
+
+``` cpp
+this commit introduced this blob
+```
+
+which is exactly what you're trying to detect.
+
+------------------------------------------------------------------------
+
+## For subtrees
+
+Same idea.
+
+Suppose:
+
+``` cpp
+dir/
+```
+
+exists in current tree.
+
+For each parent:
+
+``` cpp
+same name?
+same type tree?
+same subtree oid?
+```
+
+If subtree oid is identical:
+
+``` cpp
+reuse parent subtree
+```
+
+If subtree oid differs:
+
+``` cpp
+include parent subtree in child frame
+```
+
+Then push:
+
+``` cpp
+Frame child;
+
+child.current = current_subtree;
+
+child.parents = matching_parent_subtrees_that_differ;
+
+stack.push_back(child);
+```
+
+This is the crucial optimization.
+
+------------------------------------------------------------------------
+
+### Example
+
+Current:
+
+    src/
+    docs/
+    README
+
+Parent1:
+
+    src/
+    docs/
+    README
+
+Parent2:
+
+    src/
+    docs/
+    README
+
+Suppose:
+
+``` text
+src oid identical everywhere
+docs oid identical everywhere
+README changed
+```
+
+Then:
+
+You never descend into:
+
+    src/
+    docs/
+
+at all.
+
+You only inspect:
+
+    README
+
+This is exactly why Git tree walks are fast.
+
+------------------------------------------------------------------------
+
+## Even better: parent pruning
+
+When entering a subtree:
+
+``` cpp
+child.parents
+```
+
+should contain only parents whose subtree oid differs.
+
+Suppose:
+
+``` text
+current src oid = abc
+
+parent1 src oid = abc
+parent2 src oid = abc
+parent3 src oid = xyz
+```
+
+Then:
+
+``` cpp
+child.parents = { parent3_src_tree }
+```
+
+Parent1 and Parent2 disappear.
+
+Huge reduction.
+
+------------------------------------------------------------------------
+
+## Mental model
+
+Instead of:
+
+> compare current tree against parent tree
+
+think:
+
+> propagate only the set of parent subtrees that still disagree with current
+
+At the root merge commit you may have:
+
+``` cpp
+parents = {p1, p2}
+```
+
+but after descending a few directories:
+
+``` cpp
+parents = {}
+```
+
+meaning:
+
+``` text
+this subtree is completely new
+```
+
+or:
+
+``` cpp
+parents = {p2}
+```
+
+meaning:
+
+``` text
+only parent2 differs here
+```
+
+This becomes extremely cheap.
+
+------------------------------------------------------------------------
+
+In fact, what you're describing is almost exactly a stripped-down version of libgit2's iterator engine:
+
+- no diff objects
+- no patch generation
+- no rename detection
+- no pathspecs
+- no worktree handling
+
+Just:
+
+> N-way synchronized tree iterator with subtree-oid pruning.
+
+That is probably the cleanest path forward, both for your standalone tool and for a future `diff_light_generate.c` implementation.
+
+## Prompt:
+
+6/20/2026, 5:39:51 PM
+
+> Represent the work as a stack of frames:
+>
+> C++
+
+ok, try to implement this.  
+i assume this requires more than "just replace the compare_tree function", because currently my main function is based on git_revwalk_next, but that fails on merge commits, because it visits only the first parent (does it...?), so i guess i need to do the stack processing already in my main function
+
+
+    int main() {
+        git_libgit2_init();
+
+        git_repository *repo = nullptr;
+        git_revwalk *walk = nullptr;
+
+        // open repo
+        if (git_repository_open(&repo, ".") != 0) {
+            std::cerr << "failed to open repo\n";
+            return 1;
+        }
+
+        // walk commits in repo
+        git_revwalk_new(&walk, repo);
+
+        // start walking at the HEAD commit
+        git_revwalk_push_head(walk);
+
+        // Topological order is not cache-friendly.
+        // git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL);
+        // git_revwalk_sorting(walk, GIT_SORT_TIME);
+        // git_revwalk_sorting(walk, GIT_SORT_REVERSE);
+        git_revwalk_sorting(walk, GIT_SORT_NONE);
+
+        auto ctx = std::make_unique<Context>();
+
+        ctx->start_time = std::chrono::steady_clock::now();
+        ctx->last_print_time = ctx->start_time;
+
+        // ctx->remaining = collect_head_tree(repo);
+        ctx->blobs = collect_head_blobs(repo);
+
+        if (DEBUG) {
+            // std::cerr << "wanted blobs size: " << ctx->blobs.size() << "\n";
+            for (auto blob : ctx->blobs) {
+                // std::cerr << "wanted blob: " << git_oid_tostr_s(&blob.first) << " " << blob.second.path << "\n";
+            }
+        }
+
+        if (DEBUG) {
+            for (auto &[oid, info] : ctx->blobs) {
+                if (info.path == "ci.nix") {
+                    std::cerr
+                        << "720: HEAD ci.nix blob="
+                        << git_oid_tostr_s(&oid)
+                        << "\n";
+                }
+            }
+        }
+
+        git_oid oid;
+
+        // loop commits
+        while (!git_revwalk_next(&oid, walk)) {
+
+            ctx->commits++;
+
+            if (ctx->commits % PRINT_STATS_EVERY_N_COMMITS == 0) {
+                print_stats(*ctx);
+            }
+
+            // std::cerr << "commit: " << git_oid_tostr_s(&oid) << "\n"; // debug
+
+            git_commit *commit;
+            git_commit_lookup(&commit, repo, &oid);
+
+            // // skip merge commits
+            // if (git_commit_parentcount(commit) > 1)
+            //     continue;
+
+            ctx->is_merge = git_commit_parentcount(commit) > 1;
+
+            if (DEBUG) {
+                if (ctx->is_merge) {
+                    std::cerr << "760: commit=" << git_oid_tostr_s(&oid)
+                        << " parentcount=" << git_commit_parentcount(commit)
+                        << "\n";
+                }
+            }
+
+            // get parent trees
+            ctx->parent_trees.clear();
+            for (unsigned i = 0; i < git_commit_parentcount(commit); i++)
+            {
+                git_commit *parent = nullptr;
+                git_tree *ptree = nullptr;
+
+                git_commit_parent(&parent, commit, i);
+                git_commit_tree(&ptree, parent);
+
+                ctx->parent_trees.push_back(ptree);
+
+                git_commit_free(parent);
+            }
+
+            git_time_t t = git_commit_time(commit);
+
+            git_tree *tree;
+            git_commit_tree(&tree, commit);
+
+            git_tree *parent_tree = nullptr; // first parent
+
+            if (git_commit_parentcount(commit) > 0) {
+                // commit is not the root commit
+                git_commit *parent;
+                git_commit_parent(&parent, commit, 0);
+                git_commit_tree(&parent_tree, parent);
+                git_commit_free(parent);
+            }
+
+            ctx->time = git_commit_time(commit);
+            ctx->oid = &oid;
+            ctx->commit = commit;
+            ctx->repo = repo;
+
+            git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
+            opts.flags |= GIT_DIFF_INCLUDE_UNTRACKED;
+
+            if (ctx->is_merge) {
+                if (DEBUG) {
+                    std::cerr << "800: calling compare_tree_merge\n";
+                }
+                // recursion
+                // FIXME avoid recursion
+                compare_tree_merge(tree, "", ctx.get());
+            }
+            else {
+                if (DEBUG) {
+                    std::cerr << "810: calling compare_tree\n";
+                }
+
+                // FIXME we must call compare_tree with all parents
+                // in most cases, there is only one parent
+                // but merge commits have 2 (or more?) parents
+                // recursion
+                // FIXME avoid recursion
+                compare_tree(parent_tree, tree, "", "", ctx.get());
+            }
+
+            // free memory
+            // TODO cache trees and subtrees
+            if (parent_tree)
+                git_tree_free(parent_tree);
+            git_tree_free(tree);
+            git_commit_free(commit);
+
+            // // stop early
+            // if (ctx->remaining.empty())
+            //     break;
+        }
+
+        git_revwalk_free(walk);
+        git_repository_free(repo);
+
+        git_libgit2_shutdown();
+
+        // output result
+        for (const auto &kv : ctx->blobs) {
+            std::cout << kv.second.time << " " << kv.second.path << "\n";
+        }
+
+    }
+
+## Response:
+
+6/20/2026, 5:39:56 PM
+
+I think you're mixing up two different graphs:
+
+1.  **commit graph** (`git_revwalk`)
+2.  **tree graph** (directories/subtrees inside one commit)
+
+The stack I proposed replaces recursion in the **tree graph**, not in the commit graph.
+
+So:
+
+``` cpp
+while (!git_revwalk_next(&oid, walk))
+```
+
+is still completely fine.
+
+You should keep that.
+
+`git_revwalk` already visits every commit, including merge commits.
+
+The problem is not that it only visits the first parent.
+
+The problem is that *your tree comparison* only compares against the first parent.
+
+------------------------------------------------------------------------
+
+So I would keep:
+
+``` cpp
+while (!git_revwalk_next(&oid, walk))
+{
+    ...
+}
+```
+
+almost unchanged.
+
+The big refactor is:
+
+``` cpp
+compare_tree(...)
+compare_tree_merge(...)
+```
+
+becomes:
+
+``` cpp
+compare_tree_nway(...)
+```
+
+which handles:
+
+``` cpp
+0 parents
+1 parent
+2 parents
+N parents
+```
+
+using exactly the same code.
+
+------------------------------------------------------------------------
+
+# New frame type
+
+Something like:
+
+``` cpp
+struct TreeFrame
+{
+    git_tree *current;
+
+    std::vector<git_tree*> parents;
+
+    std::string root;
+};
+```
+
+Notice:
+
+``` cpp
+std::vector<git_tree*> parents;
+```
+
+There is no special case anymore.
+
+------------------------------------------------------------------------
+
+# Main loop
+
+Instead of:
+
+``` cpp
+if (ctx->is_merge)
+    compare_tree_merge(...)
+else
+    compare_tree(...)
+```
+
+just:
+
+``` cpp
+compare_tree_nway(tree, ctx->parent_trees, "", ctx.get());
+```
+
+------------------------------------------------------------------------
+
+# Inside compare_tree_nway
+
+No recursion.
+
+Create:
+
+``` cpp
+std::vector<TreeFrame> stack;
+
+stack.push_back({
+    current,
+    parents,
+    root
+});
+```
+
+Then:
+
+``` cpp
+while (!stack.empty())
+{
+    TreeFrame frame =
+        std::move(stack.back());
+
+    stack.pop_back();
+
+    ...
+}
+```
+
+------------------------------------------------------------------------
+
+# Key observation
+
+For every directory level:
+
+``` text
+current tree
+parent tree 1
+parent tree 2
+parent tree 3
+...
+```
+
+all entries are sorted.
+
+So for the current entry:
+
+``` cpp
+ce
+```
+
+you advance each parent cursor until:
+
+``` cpp
+parent_name >= current_name
+```
+
+exactly like merging sorted arrays.
+
+------------------------------------------------------------------------
+
+# Even simpler
+
+I would not keep parent indices across iterations.
+
+Instead:
+
+For each frame:
+
+``` cpp
+std::vector<size_t> pidx(frame.parents.size(), 0);
+```
+
+Then walk current entries:
+
+``` cpp
+for (size_t c = 0; c < current_n; c++)
+{
+    ...
+}
+```
+
+and advance parent indices as you go.
+
+Exactly like your old 2-way merge walk.
+
+------------------------------------------------------------------------
+
+# The really important optimization
+
+When you encounter:
+
+``` text
+current: src/
+parent1: src/
+parent2: src/
+```
+
+and all subtree oids are identical:
+
+``` cpp
+current_oid == parent1_oid
+current_oid == parent2_oid
+```
+
+then:
+
+``` cpp
+continue;
+```
+
+Don't descend.
+
+This is where almost all performance comes from.
+
+------------------------------------------------------------------------
+
+# When subtree differs
+
+Build a child frame:
+
+``` cpp
+TreeFrame child;
+
+child.current = current_subtree;
+child.root = root + "/" + name;
+```
+
+Now gather only differing parents:
+
+``` cpp
+for each matching parent subtree
+{
+    if (!git_oid_equal(parent_oid, current_oid))
+        child.parents.push_back(parent_subtree);
+}
+```
+
+Notice what happened.
+
+Suppose:
+
+``` text
+current src = abc
+
+parent1 src = abc
+parent2 src = abc
+parent3 src = xyz
+```
+
+Then:
+
+``` cpp
+child.parents.size() == 1
+```
+
+Only parent3 survives.
+
+Huge win.
+
+------------------------------------------------------------------------
+
+# Even more aggressive
+
+You can represent parent entries directly.
+
+Instead of:
+
+``` cpp
+child.parents.push_back(parent_subtree);
+```
+
+store:
+
+``` cpp
+struct ParentMatch
+{
+    git_tree *tree;
+    size_t idx;
+};
+```
+
+or even cache subtree OIDs.
+
+But I wouldn't start there.
+
+------------------------------------------------------------------------
+
+# What I'd do first
+
+Delete both:
+
+``` cpp
+compare_tree()
+compare_tree_merge()
+```
+
+and replace them with:
+
+``` cpp
+compare_tree_nway(
+    git_tree *current,
+    const std::vector<git_tree*> &parents,
+    const std::string &root,
+    Context *ctx)
+```
+
+using:
+
+``` cpp
+std::vector<TreeFrame> stack;
+```
+
+internally.
+
+Keep the revwalk exactly as it is.
+
+The revwalk is not the source of the complexity. The recursion and the separate merge/non-merge tree walkers are. The goal is a single N-parent tree walker that naturally handles 0, 1, or many parents with the same algorithm.
+
+## Prompt:
+
+6/20/2026, 5:47:37 PM
+
+> `git_revwalk` already visits every commit, including merge commits.
+
+but does git_revwalk visit every parent commit of merge commits? that was my worry. maybe we have to enable this in the git_revwalk object?
+
+if git_revwalk does visit every parent commit of merge commits, then yes, there is nothing to do here, and we can focus on the implementation of compare_tree_nway
+
+## Response:
+
+6/20/2026, 5:47:43 PM
+
+Yes, `git_revwalk` visits merge commits and all reachable commits by default.
+
+Your worry would only be valid if `git_revwalk` followed only the first-parent chain, but it doesn't.
+
+For example:
+
+``` text
+A---B---C---M
+     \     /
+      D---E
+```
+
+Starting from `M`:
+
+``` cpp
+git_revwalk_push_head(walk);
+```
+
+the revwalk will eventually visit:
+
+``` text
+M
+C
+E
+B
+D
+A
+```
+
+(order depends on sorting mode).
+
+It does **not** stop at the first parent.
+
+------------------------------------------------------------------------
+
+You can verify this quickly:
+
+``` bash
+git rev-list --all | wc -l
+```
+
+should match:
+
+``` cpp
+size_t n = 0;
+while (!git_revwalk_next(&oid, walk))
+    n++;
+```
+
+for the same reachable commit set.
+
+------------------------------------------------------------------------
+
+What Git calls "first-parent traversal" is a special mode.
+
+In libgit2 there is:
+
+``` c
+git_revwalk_simplify_first_parent(walk);
+```
+
+If you call that, then:
+
+``` text
+A---B---C---M
+     \     /
+      D---E
+```
+
+becomes:
+
+``` text
+M
+C
+B
+A
+```
+
+and `D` and `E` disappear.
+
+But your code never calls:
+
+``` c
+git_revwalk_simplify_first_parent(...)
+```
+
+so you're not in first-parent mode.
+
+------------------------------------------------------------------------
+
+The evidence is actually in your bug.
+
+You observed:
+
+``` text
+merge commit M
+parent1 contains file3 blob X
+parent2 contains file3 blob Y
+merge commit contains blob X
+```
+
+Your algorithm incorrectly marked `file3` as modified in `M`.
+
+That can only happen because the merge commit **is being visited**.
+
+The problem is not that the merge commit was skipped.
+
+The problem is that when visiting `M`, your code compared:
+
+``` text
+M vs parent1
+```
+
+instead of:
+
+``` text
+M vs parent1 and parent2
+```
+
+and therefore concluded:
+
+``` text
+blob Y -> blob X
+```
+
+looked like a modification, even though blob X already existed in another parent.
+
+------------------------------------------------------------------------
+
+So I would be quite confident:
+
+``` cpp
+while (!git_revwalk_next(&oid, walk))
+```
+
+is already doing the correct thing.
+
+The remaining work is entirely inside:
+
+``` cpp
+compare_tree(...)
+```
+
+which should become:
+
+``` cpp
+compare_tree_nway(...)
+```
+
+and understand:
+
+``` text
+current tree
+vs
+0..N parent trees
+```
+
+in one unified algorithm.
+
+## Prompt:
+
+6/20/2026, 6:03:31 PM
+
+ok, so the git_revwalk problem is solved.
+
+show me an implementation of compare_tree_nway. it should loop all files in the current tree, compare them to the files in all parent trees, detect when a file was added or copied or modified by the current commit and in that case copy the commit time to the file's last-modified time in ctx, and set the file's has_time=true, so we can skip checking that file in future iterations. it should also detect when a file was modified by a merge commit (when a file was not simply copied from a parent commit) then it should use the commit time of the merge commit as the file's last-modified time.
+
+it also should detect renames of files = the same blob_id as removed from path A and added to path B. as long as we are walking multiple commit histories in parallel (multiple "current" trees in parallel), we have to store all paths of that blob_id, but as soon as we have only one "current" tree, then we can forget about the renames, and every file has exactly one current_path (which can be different from the file path in the HEAD commit)
+
+## Response:
+
+6/20/2026, 6:03:39 PM
+
+I think there is one more conceptual step before writing code.
+
+What you describe here:
+
+> loop all files in the current tree, compare them to the files in all parent trees
+
+is not sufficient for rename detection.
+
+For rename detection you must also see files that exist only in parents.
+
+Example:
+
+``` text
+parent:
+    A -> blob X
+
+current:
+    B -> blob X
+```
+
+When walking only current entries, you see:
+
+``` text
+B -> blob X
+```
+
+and conclude:
+
+``` text
+added
+```
+
+but you never saw:
+
+``` text
+A -> blob X
+```
+
+so you cannot detect the rename.
+
+------------------------------------------------------------------------
+
+I would therefore separate the problem into two passes.
+
+# Pass 1: tree walk
+
+Produce events:
+
+``` cpp
+enum ChangeKind {
+    Added,
+    Deleted,
+    Modified,
+};
+```
+
+and
+
+``` cpp
+struct Change {
+    ChangeKind kind;
+
+    std::string path;
+
+    git_oid oid;
+};
+```
+
+For every commit:
+
+``` cpp
+std::vector<Change> changes;
+```
+
+You don't immediately set timestamps.
+
+You only collect facts.
+
+------------------------------------------------------------------------
+
+Example
+
+``` text
+parent:
+    A -> X
+
+current:
+    B -> X
+```
+
+produces:
+
+``` text
+Deleted(A,X)
+Added(B,X)
+```
+
+------------------------------------------------------------------------
+
+# Pass 2: rename matching
+
+Build:
+
+``` cpp
+unordered_multimap<git_oid, Change*>
+```
+
+for added blobs.
+
+Then:
+
+``` cpp
+Deleted(A,X)
+Added(B,X)
+```
+
+becomes:
+
+``` text
+Rename(A,B,X)
+```
+
+------------------------------------------------------------------------
+
+Only after rename resolution do you decide:
+
+``` text
+Added
+Modified
+Copied
+Rename
+Merge-resolution
+```
+
+------------------------------------------------------------------------
+
+This dramatically simplifies compare_tree_nway.
+
+Because compare_tree_nway only answers:
+
+> What disappeared?  
+> What appeared?  
+> What changed?
+
+and nothing else.
+
+------------------------------------------------------------------------
+
+# More important: current BlobState is insufficient
+
+Currently:
+
+``` cpp
+struct BlobState {
+    std::string path;
+    git_time_t time;
+    bool has_time;
+};
+```
+
+This assumes:
+
+``` text
+blob -> one path
+```
+
+which is false during history traversal.
+
+Example:
+
+``` text
+HEAD:
+    C -> blob X
+```
+
+History:
+
+``` text
+A -> blob X
+rename A->B
+rename B->C
+```
+
+Walking backwards you may encounter:
+
+``` text
+C
+B
+A
+```
+
+for the same blob.
+
+So you need:
+
+``` cpp
+struct BlobState {
+    std::vector<std::string> paths;
+};
+```
+
+or
+
+``` cpp
+std::unordered_set<std::string>
+```
+
+during traversal.
+
+------------------------------------------------------------------------
+
+Actually I'd go further.
+
+Your key should not be:
+
+``` cpp
+blob oid
+```
+
+alone.
+
+You need something like:
+
+``` cpp
+struct LiveBlob {
+    git_oid oid;
+
+    std::unordered_set<std::string> paths;
+
+    bool has_time;
+
+    git_time_t time;
+};
+```
+
+because a blob may simultaneously exist at multiple paths in a merge.
+
+------------------------------------------------------------------------
+
+# About multiple "current" trees
+
+This is the really interesting part.
+
+You wrote:
+
+> as long as we are walking multiple commit histories in parallel
+
+That's actually a different algorithm from your current revwalk.
+
+Current code:
+
+``` cpp
+git_revwalk_next(...)
+```
+
+visits commits individually.
+
+One current commit at a time.
+
+Not multiple histories in parallel.
+
+------------------------------------------------------------------------
+
+What you're describing now is closer to:
+
+``` text
+HEAD
+├── parent1
+└── parent2
+```
+
+and tracking the same blob simultaneously down both branches.
+
+That's not a revwalk anymore.
+
+That's a DAG traversal with state propagation.
+
+A very different beast.
+
+------------------------------------------------------------------------
+
+If your goal is:
+
+> last modification time of every blob currently in HEAD
+
+then I would not attempt full multi-history propagation yet.
+
+I would first get:
+
+``` cpp
+compare_tree_nway()
+```
+
+working for:
+
+``` text
+current tree
+vs
+N parent trees
+```
+
+and emit:
+
+``` cpp
+Added
+Deleted
+Modified
+```
+
+events.
+
+Then add rename resolution.
+
+Then later add DAG-level blob tracking.
+
+Trying to solve all three simultaneously:
+
+1.  N-way tree comparison
+2.  rename detection
+3.  multi-branch blob propagation
+
+is where the complexity explosion is coming from.
+
+------------------------------------------------------------------------
+
+One thing I am fairly confident about:
+
+the final compare_tree_nway should not directly call:
+
+``` cpp
+it->second.time = ctx->time;
+```
+
+while walking.
+
+It should first produce a normalized stream of events:
+
+``` text
+ADD(path, oid)
+DELETE(path, oid)
+MODIFIED(path, old_oid, new_oid)
+```
+
+Then a second stage decides:
+
+``` text
+ADD + DELETE same oid = rename
+
+ADD with oid already present in another parent = copy
+
+MODIFIED in merge commit = merge resolution
+
+ADD not present anywhere = true add
+```
+
+That separation will make the code much easier to reason about than the current giant `compare_tree()` state machine.
+
+## Prompt:
+
+6/20/2026, 8:47:10 PM
+
+> a blob may simultaneously exist at multiple paths in a merge.
+
+yes, but each path of a blob is valid for only some commit histories ("branches"), but not for other commit histories, so when we are visiting multiple branches "in parallel", then we need to keep track of which branch we are currently walking, so we know this branch's version of the file paths of the files we care about. so when we get the next commit from git_revwalk_next, we need to know whether that commit is part of the main branch or part of some side branch (parent commits of merge commits)
+
+git_revwalk is walking multiple branches "in parallel", so that repeated calls to git_revwalk_next can return commits from different branches, and when only one of these branches has a "rename file" commit, then that rename is valid for that branch only, until all branches agree on the same file path, then we can treat the rename as "global"
+
+blah. with that said...
+
+give me an implementation of the compare_tree_nway function
+
+## Response:
+
+6/20/2026, 8:47:37 PM
+
+Before the code, one important correction:
+
+> git_revwalk is walking multiple branches "in parallel"
+
+Not really.
+
+`git_revwalk` is only producing a linear sequence of commits.
+
+It does **not** maintain branch identity.
+
+For example:
+
+``` text
+      D---E
+     /     \
+A---B---C---M
+```
+
+you might get:
+
+``` text
+M
+E
+D
+C
+B
+A
+```
+
+or
+
+``` text
+M
+C
+E
+B
+D
+A
+```
+
+depending on sort order.
+
+Once `M` has been emitted, the walker has forgotten which side was "left branch" and which side was "right branch".
+
+So if you want branch-specific rename tracking, that state cannot come from `git_revwalk`; you'd have to build it yourself.
+
+------------------------------------------------------------------------
+
+Now for `compare_tree_nway`.
+
+I would *not* implement rename detection inside it.
+
+I would make it answer only:
+
+``` text
+does current entry exist unchanged in any parent?
+```
+
+which is exactly what you need for the "last modification time" problem.
+
+------------------------------------------------------------------------
+
+Something like:
+
+``` cpp
+struct TreeFrame
+{
+    git_tree *current;
+    std::vector<git_tree*> parents;
+    std::string root;
+};
+```
+
+Helper:
+
+``` cpp
+static void mark_blob_modified(
+    const git_oid *coid,
+    const std::string &path,
+    Context *ctx)
+{
+    auto it = ctx->blobs.find(*coid);
+
+    if (it == ctx->blobs.end())
+        return;
+
+    if (it->second.has_time)
+        return;
+
+    it->second.time = ctx->time;
+    it->second.has_time = true;
+
+    ctx->num_remaining--;
+    ctx->files_found++;
+
+    if (DEBUG) {
+        std::cerr
+            << "setting time: path=" << path
+            << " time=" << ctx->time
+            << " commit=" << git_oid_tostr_s(ctx->oid)
+            << "\n";
+    }
+}
+```
+
+------------------------------------------------------------------------
+
+Now the actual walker.
+
+``` cpp
+static void compare_tree_nway(
+    git_tree *root_tree,
+    const std::vector<git_tree*> &root_parents,
+    const std::string &root_path,
+    Context *ctx)
+{
+    std::vector<TreeFrame> stack;
+
+    stack.push_back({
+        root_tree,
+        root_parents,
+        root_path
+    });
+
+    while (!stack.empty())
+    {
+        TreeFrame frame =
+            std::move(stack.back());
+
+        stack.pop_back();
+
+        size_t current_n =
+            git_tree_entrycount(frame.current);
+
+        std::vector<size_t> pidx(
+            frame.parents.size(),
+            0
+        );
+
+        for (size_t c = 0; c < current_n; ++c)
+        {
+            const git_tree_entry *ce =
+                git_tree_entry_byindex(
+                    frame.current,
+                    c);
+
+            const char *name =
+                git_tree_entry_name(ce);
+
+            git_object_t ctype =
+                git_tree_entry_type(ce);
+
+            const git_oid *coid =
+                git_tree_entry_id(ce);
+
+            std::string path =
+                join_paths_3(
+                    frame.root,
+                    "",
+                    name);
+
+            bool identical_in_parent = false;
+
+            std::vector<git_tree*> child_parents;
+
+            //
+            // search matching entry in every parent
+            //
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                git_tree *parent =
+                    frame.parents[pi];
+
+                size_t parent_n =
+                    git_tree_entrycount(parent);
+
+                size_t &p = pidx[pi];
+
+                while (p < parent_n)
+                {
+                    const git_tree_entry *pe =
+                        git_tree_entry_byindex(
+                            parent,
+                            p);
+
+                    int cmp =
+                        strcmp(
+                            git_tree_entry_name(pe),
+                            name);
+
+                    if (cmp < 0)
+                    {
+                        ++p;
+                        continue;
+                    }
+
+                    if (cmp > 0)
+                        break;
+
+                    //
+                    // same name
+                    //
+
+                    git_object_t ptype =
+                        git_tree_entry_type(pe);
+
+                    const git_oid *poid =
+                        git_tree_entry_id(pe);
+
+                    if (ptype == ctype)
+                    {
+                        if (git_oid_equal(
+                                poid,
+                                coid))
+                        {
+                            identical_in_parent =
+                                true;
+                        }
+
+                        if (ctype ==
+                            GIT_OBJECT_TREE)
+                        {
+                            git_tree *ptree =
+                                nullptr;
+
+                            git_tree_lookup(
+                                &ptree,
+                                ctx->repo,
+                                poid);
+
+                            child_parents.push_back(
+                                ptree);
+                        }
+                    }
+
+                    break;
+                }
+            }
+
+            //
+            // blob
+            //
+
+            if (ctype == GIT_OBJECT_BLOB)
+            {
+                if (!identical_in_parent)
+                {
+                    mark_blob_modified(
+                        coid,
+                        path,
+                        ctx);
+                }
+
+                continue;
+            }
+
+            //
+            // subtree
+            //
+
+            if (ctype == GIT_OBJECT_TREE)
+            {
+                if (identical_in_parent &&
+                    child_parents.empty())
+                {
+                    continue;
+                }
+
+                git_tree *ctree =
+                    nullptr;
+
+                git_tree_lookup(
+                    &ctree,
+                    ctx->repo,
+                    coid);
+
+                stack.push_back({
+                    ctree,
+                    std::move(child_parents),
+                    path
+                });
+
+                continue;
+            }
+        }
+    }
+}
+```
+
+This is intentionally the minimal version:
+
+- no recursion
+- handles 0, 1, or N parents
+- skips unchanged blobs
+- skips identical subtrees
+- correctly handles merge commits where a blob exists unchanged in *any* parent
+- correctly marks merge-resolution commits where the resulting blob differs from all parents
+
+Example:
+
+``` text
+parent1: file = A
+parent2: file = B
+merge:   file = A
+```
+
+Result:
+
+``` text
+identical_in_parent = true
+```
+
+so merge commit is **not** considered a modification.
+
+Example:
+
+``` text
+parent1: file = A
+parent2: file = B
+merge:   file = C
+```
+
+Result:
+
+``` text
+identical_in_parent = false
+```
+
+so merge commit **is** considered a modification.
+
+------------------------------------------------------------------------
+
+What this does **not** yet solve:
+
+``` text
+rename A -> B
+copy A -> B
+delete A
+```
+
+Those require tracking paths and deleted entries and are better handled as a second layer after this walker works correctly and fast. Right now I'd first get the merge semantics correct and verify that the bogus timestamps on merge commits disappear.
+
+## Prompt:
+
+6/21/2026, 7:57:43 AM
+
+bad news:
+
+1.  this is slow, about 100x slower than my "fast but wrong" version
+2.  this runs out of memory
+
+<!-- -->
+
+    [user@laptop:~/src/nixos/nixpkgs]$ time /home/user/src/milahu/git-file-times/build/git-file-times >file-times.fast.compare_tree_nway.txt
+    stats: commits=1000 time=50.5879 eta=589.582 commits/s=19.7676 files_done=4123 files/s=81.5018 deltas/s=0 progress=7.90225%
+    stats: commits=2000 time=88.9705 eta=3780.17 commits/s=26.0534 files_done=4606 files/s=12.5838 deltas/s=0 progress=8.82798%
+    stats: commits=3000 time=129.36 eta=3929.2 commits/s=24.759 files_done=5090 files/s=11.9834 deltas/s=0 progress=9.75563%
+    stats: commits=4000 time=169.106 eta=4322.63 commits/s=25.1595 files_done=5519 files/s=10.7934 deltas/s=0 progress=10.5779%
+    stats: commits=5000 time=217.118 eta=4284.75 commits/s=20.8282 files_done=6036 files/s=10.7682 deltas/s=0 progress=11.5688%
+    stats: commits=6000 time=268.845 eta=11822 commits/s=19.3324 files_done=6237 files/s=3.88581 deltas/s=0 progress=11.954%
+    stats: commits=7000 time=331.725 eta=6897.56 commits/s=15.9033 files_done=6652 files/s=6.59987 deltas/s=0 progress=12.7494%
+    stats: commits=8000 time=382.034 eta=6868.75 commits/s=19.8772 files_done=6983 files/s=6.57936 deltas/s=0 progress=13.3838%
+    stats: commits=9000 time=448.519 eta=7861.2 commits/s=15.041 files_done=7362 files/s=5.70053 deltas/s=0 progress=14.1102%
+    stats: commits=10000 time=514.001 eta=7718.25 commits/s=15.2713 files_done=7739 files/s=5.75727 deltas/s=0 progress=14.8328%
+    stats: commits=11000 time=623.306 eta=16244.5 commits/s=9.14872 files_done=8036 files/s=2.71717 deltas/s=0 progress=15.402%
+    stats: commits=12000 time=695.591 eta=5707.78 commits/s=13.8341 files_done=8588 files/s=7.63641 deltas/s=0 progress=16.46%
+    stats: commits=13000 time=768.751 eta=8960.28 commits/s=13.6688 files_done=8941 files/s=4.82507 deltas/s=0 progress=17.1366%
+    stats: commits=14000 time=838.839 eta=10752 commits/s=14.2678 files_done=9221 files/s=3.99497 deltas/s=0 progress=17.6732%
+    stats: commits=15000 time=920.683 eta=11875.8 commits/s=12.2183 files_done=9515 files/s=3.59218 deltas/s=0 progress=18.2367%
+    Killed                     /home/user/src/milahu/git-file-times/build/git-file-times > file-times.fast.compare_tree_nway.txt
+
+    real    37m10,662s
+    user    10m11,955s
+    sys     2m58,199s
+
+## Response:
+
+6/21/2026, 7:57:49 AM
+
+The memory explosion is easy to explain.
+
+My implementation leaks every subtree lookup.
+
+Look at this part:
+
+``` cpp
+git_tree_lookup(&ptree, ctx->repo, poid);
+child_parents.push_back(ptree);
+```
+
+and later:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    path
+});
+```
+
+Nothing ever frees those trees.
+
+Every subtree visited allocates another `git_tree`.
+
+In nixpkgs:
+
+``` text
+millions of subtrees
+```
+
+so eventually:
+
+``` text
+OOM
+```
+
+------------------------------------------------------------------------
+
+But that's not the main problem.
+
+The main problem is that the algorithm is fundamentally doing too much work.
+
+Look at the complexity.
+
+Your old version:
+
+``` text
+current tree
+vs
+first parent
+```
+
+used a merge walk:
+
+``` text
+O(current_entries + parent_entries)
+```
+
+per tree.
+
+------------------------------------------------------------------------
+
+My N-way version does:
+
+``` text
+for each current entry
+    search every parent
+```
+
+which is roughly:
+
+``` text
+O(current_entries * num_parents)
+```
+
+and worse, every subtree lookup becomes:
+
+``` cpp
+git_tree_lookup(...)
+```
+
+which hits the object database repeatedly.
+
+------------------------------------------------------------------------
+
+Even worse:
+
+For every blob:
+
+``` cpp
+identical_in_parent = false;
+
+for every parent
+    search matching name
+```
+
+so you have turned:
+
+``` text
+linear merge walk
+```
+
+into:
+
+``` text
+many repeated searches
+```
+
+------------------------------------------------------------------------
+
+The important realization is:
+
+You do NOT want:
+
+``` text
+current tree
+vs N parent trees
+```
+
+You want:
+
+``` text
+N+1-way merge walk
+```
+
+Exactly like Git's diff iterator.
+
+------------------------------------------------------------------------
+
+Think of:
+
+``` text
+current:
+    a
+    c
+    e
+
+parent1:
+    a
+    b
+    e
+
+parent2:
+    a
+    d
+    e
+```
+
+Instead of:
+
+``` text
+for current entry:
+    search all parents
+```
+
+you maintain:
+
+``` cpp
+cidx
+pidx[0]
+pidx[1]
+...
+```
+
+and advance all simultaneously.
+
+Exactly what your original compare_tree already does for 2 trees.
+
+------------------------------------------------------------------------
+
+Pseudo:
+
+``` cpp
+while(any iterator alive)
+{
+    smallest_name =
+        min(current_name,
+            parent1_name,
+            parent2_name,
+            ...);
+
+    process all entries
+        having that name
+
+    advance only those iterators
+}
+```
+
+Complexity:
+
+``` text
+O(total entries)
+```
+
+instead of
+
+``` text
+O(current × parents)
+```
+
+------------------------------------------------------------------------
+
+Even more important:
+
+You already discovered the key optimization earlier:
+
+> don't recurse into identical subtrees
+
+That's exactly what Git's iterator does.
+
+Example:
+
+``` text
+parent1:
+    pkgs/
+
+parent2:
+    pkgs/
+
+current:
+    pkgs/
+```
+
+all point to same tree oid:
+
+``` text
+abc123
+```
+
+Then:
+
+``` cpp
+if (all tree oids equal)
+    skip entire subtree
+```
+
+No recursion.
+
+No child loading.
+
+No tree walk.
+
+------------------------------------------------------------------------
+
+For nixpkgs this is enormous.
+
+Most commits modify:
+
+``` text
+1-5 files
+```
+
+out of:
+
+``` text
+100000+
+```
+
+files.
+
+So most subtrees are identical.
+
+------------------------------------------------------------------------
+
+I think your next version should be:
+
+``` cpp
+struct Frame
+{
+    git_tree* current;
+    std::vector<git_tree*> parents;
+
+    size_t current_idx;
+    std::vector<size_t> parent_idx;
+
+    std::string root;
+};
+```
+
+and then:
+
+``` cpp
+std::vector<Frame> stack;
+```
+
+(no recursion)
+
+and perform a true:
+
+``` text
+N+1-way merge walk
+```
+
+inside each frame.
+
+------------------------------------------------------------------------
+
+Another observation:
+
+You probably should not be doing:
+
+``` cpp
+git_tree_lookup(...)
+```
+
+for every subtree.
+
+Instead keep:
+
+``` cpp
+struct LoadedTree {
+    git_oid oid;
+    git_tree* tree;
+};
+```
+
+cache.
+
+Because in history traversal the same subtree OID appears again and again.
+
+Example:
+
+``` text
+commit A
+commit B
+commit C
+```
+
+all reference the same:
+
+``` text
+pkgs/development/python-modules
+```
+
+subtree.
+
+Loading it once is enough.
+
+------------------------------------------------------------------------
+
+So my diagnosis is:
+
+### OOM
+
+caused by:
+
+``` cpp
+git_tree_lookup(...)
+```
+
+objects never freed.
+
+### 100x slowdown
+
+caused by:
+
+``` text
+for every current entry
+    search every parent
+```
+
+instead of:
+
+``` text
+single N-way merge walk
+```
+
+The good news is that your original `compare_tree()` is already about 80% of the correct N-way algorithm. The fastest path is probably extending that merge-walk machinery to N parents rather than switching to the "check every parent for every entry" approach.
+
+## Prompt:
+
+6/21/2026, 8:04:26 AM
+
+> single N-way merge walk
+
+yes, give me an implementation
+
+## Response:
+
+6/21/2026, 8:04:31 AM
+
+Yes. The key is: don't iterate over current entries and then search parents. Instead, generalize your existing 2-way merge walk.
+
+Your current algorithm is essentially:
+
+``` text
+parent:   a b d e
+current:  a c d f
+
+walk:
+
+a=a
+b<c
+c>b
+d=d
+e<f
+f>e
+```
+
+For N parents, do exactly the same thing:
+
+``` text
+parent1:  a b d e
+parent2:  a c d g
+current:  a c d f
+
+smallest name = a
+smallest name = b
+smallest name = c
+smallest name = d
+smallest name = e
+smallest name = f
+smallest name = g
+```
+
+No searching.
+
+No path lookups.
+
+No tree_contains_blob_at_path.
+
+No maps.
+
+Complexity stays linear.
+
+------------------------------------------------------------------------
+
+# Core idea
+
+At every step:
+
+``` cpp
+current entry
+parent entry 0
+parent entry 1
+...
+parent entry N-1
+```
+
+Find the lexicographically smallest name among all alive entries.
+
+Process that name.
+
+Advance only iterators that currently point to that name.
+
+Exactly how merge-sort works.
+
+------------------------------------------------------------------------
+
+# Frame
+
+``` cpp
+struct TreeFrame
+{
+    git_tree *current;
+
+    std::vector<git_tree*> parents;
+
+    std::vector<size_t> pidx;
+
+    size_t cidx;
+
+    std::string root;
+};
+```
+
+------------------------------------------------------------------------
+
+# Helper
+
+``` cpp
+static const git_tree_entry *get_entry(
+    git_tree *tree,
+    size_t idx)
+{
+    if (!tree)
+        return nullptr;
+
+    if (idx >= git_tree_entrycount(tree))
+        return nullptr;
+
+    return git_tree_entry_byindex(tree, idx);
+}
+```
+
+------------------------------------------------------------------------
+
+# Main algorithm
+
+``` cpp
+static void compare_tree_nway(
+    git_tree *root_current,
+    const std::vector<git_tree*> &root_parents,
+    Context *ctx)
+{
+    std::vector<TreeFrame> stack;
+
+    stack.push_back({
+        root_current,
+        root_parents,
+        std::vector<size_t>(root_parents.size(), 0),
+        0,
+        ""
+    });
+
+    while (!stack.empty())
+    {
+        TreeFrame frame =
+            std::move(stack.back());
+
+        stack.pop_back();
+
+        while (true)
+        {
+            const git_tree_entry *ce =
+                get_entry(
+                    frame.current,
+                    frame.cidx);
+
+            bool any_alive =
+                (ce != nullptr);
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                if (get_entry(
+                        frame.parents[pi],
+                        frame.pidx[pi]))
+                {
+                    any_alive = true;
+                    break;
+                }
+            }
+
+            if (!any_alive)
+                break;
+
+            //
+            // find smallest name
+            //
+
+            const char *min_name = nullptr;
+
+            auto consider =
+                [&](const git_tree_entry *e)
+                {
+                    if (!e)
+                        return;
+
+                    const char *name =
+                        git_tree_entry_name(e);
+
+                    if (!min_name ||
+                        strcmp(name, min_name) < 0)
+                    {
+                        min_name = name;
+                    }
+                };
+
+            consider(ce);
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                consider(
+                    get_entry(
+                        frame.parents[pi],
+                        frame.pidx[pi]));
+            }
+
+            //
+            // current entry with this name?
+            //
+
+            bool current_has =
+                ce &&
+                strcmp(
+                    git_tree_entry_name(ce),
+                    min_name) == 0;
+
+            //
+            // matching parent entries
+            //
+
+            std::vector<const git_tree_entry*> matches(
+                frame.parents.size(),
+                nullptr);
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                auto *pe =
+                    get_entry(
+                        frame.parents[pi],
+                        frame.pidx[pi]);
+
+                if (pe &&
+                    strcmp(
+                        git_tree_entry_name(pe),
+                        min_name) == 0)
+                {
+                    matches[pi] = pe;
+                }
+            }
+
+            //
+            // process current entry
+            //
+
+            if (current_has)
+            {
+                git_object_t ctype =
+                    git_tree_entry_type(ce);
+
+                const git_oid *coid =
+                    git_tree_entry_id(ce);
+
+                std::string path =
+                    join_paths_3(
+                        frame.root,
+                        "",
+                        min_name);
+
+                bool identical_in_parent =
+                    false;
+
+                std::vector<git_tree*> child_parents;
+
+                for (size_t pi = 0;
+                     pi < matches.size();
+                     ++pi)
+                {
+                    auto *pe =
+                        matches[pi];
+
+                    if (!pe)
+                        continue;
+
+                    git_object_t ptype =
+                        git_tree_entry_type(pe);
+
+                    const git_oid *poid =
+                        git_tree_entry_id(pe);
+
+                    if (ptype != ctype)
+                        continue;
+
+                    if (git_oid_equal(
+                            poid,
+                            coid))
+                    {
+                        identical_in_parent =
+                            true;
+                    }
+
+                    if (ctype ==
+                        GIT_OBJECT_TREE)
+                    {
+                        git_tree *ptree =
+                            nullptr;
+
+                        git_tree_lookup(
+                            &ptree,
+                            ctx->repo,
+                            poid);
+
+                        child_parents.push_back(
+                            ptree);
+                    }
+                }
+
+                //
+                // blob
+                //
+
+                if (ctype ==
+                    GIT_OBJECT_BLOB)
+                {
+                    if (!identical_in_parent)
+                    {
+                        auto it =
+                            ctx->blobs.find(
+                                *coid);
+
+                        if (it !=
+                            ctx->blobs.end())
+                        {
+                            if (!it->second.has_time)
+                            {
+                                it->second.time =
+                                    ctx->time;
+
+                                it->second.has_time =
+                                    true;
+
+                                ctx->files_found++;
+                            }
+                        }
+                    }
+                }
+
+                //
+                // subtree
+                //
+
+                else if (
+                    ctype ==
+                    GIT_OBJECT_TREE)
+                {
+                    if (!identical_in_parent)
+                    {
+                        git_tree *ctree =
+                            nullptr;
+
+                        git_tree_lookup(
+                            &ctree,
+                            ctx->repo,
+                            coid);
+
+                        stack.push_back({
+                            ctree,
+                            std::move(
+                                child_parents),
+                            std::vector<size_t>(
+                                child_parents.size(),
+                                0),
+                            0,
+                            path
+                        });
+                    }
+                }
+            }
+
+            //
+            // advance iterators
+            //
+
+            if (current_has)
+                frame.cidx++;
+
+            for (size_t pi = 0;
+                 pi < matches.size();
+                 ++pi)
+            {
+                if (matches[pi])
+                    frame.pidx[pi]++;
+            }
+        }
+    }
+}
+```
+
+------------------------------------------------------------------------
+
+This still needs two important fixes before production:
+
+1.  free child trees when frame is finished
+2.  add subtree cache (`git_oid -> git_tree*`)
+
+Without the cache you'll still spend a lot of time in `git_tree_lookup()`.
+
+But algorithmically this is the linear N-way merge walk you were looking for. It behaves much closer to Git's internal tree iterators than the earlier "search every parent for every current entry" version.
+
+## Prompt:
+
+6/21/2026, 8:13:50 AM
+
+this segfaults:
+
+    Program received signal SIGSEGV, Segmentation fault.
+    0x0000555555556f63 in compare_tree_nway (root_path="", root_current=<optimized out>, root_parents=std::vector of length 1, capacity 1 = {...}, 
+        ctx=0x555555712740) at /home/user/src/milahu/git-file-times/src/main.cpp:1320
+    1320                    if (get_entry(
+    (gdb) bt
+    #0  0x0000555555556f63 in compare_tree_nway (root_path="", root_current=<optimized out>, root_parents=std::vector of length 1, capacity 1 = {...}, 
+        ctx=0x555555712740) at /home/user/src/milahu/git-file-times/src/main.cpp:1320
+    #1  main () at /home/user/src/milahu/git-file-times/src/main.cpp:1692
+
+## Response:
+
+6/21/2026, 8:14:10 AM
+
+The most suspicious thing is this:
+
+``` cpp
+TreeFrame frame =
+    std::move(stack.back());
+
+stack.pop_back();
+```
+
+and later:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    std::vector<size_t>(
+        child_parents.size(),
+        0),
+    0,
+    path
+});
+```
+
+This is a bug.
+
+After:
+
+``` cpp
+std::move(child_parents)
+```
+
+the vector is moved-from.
+
+Then you immediately do:
+
+``` cpp
+child_parents.size()
+```
+
+which is technically valid but unspecified. On libstdc++ it'll usually become 0, but relying on that is wrong.
+
+------------------------------------------------------------------------
+
+But I don't think that's your crash.
+
+Looking at the crash:
+
+``` text
+compare_tree_nway
+line 1320:
+if (get_entry(...)
+```
+
+inside:
+
+``` cpp
+for (size_t pi = 0;
+     pi < frame.parents.size();
+     ++pi)
+{
+    if (get_entry(
+            frame.parents[pi],
+            frame.pidx[pi]))
+```
+
+The likely culprit is:
+
+``` cpp
+frame.parents.size()
+!=
+frame.pidx.size()
+```
+
+Then:
+
+``` cpp
+frame.pidx[pi]
+```
+
+walks off the end.
+
+------------------------------------------------------------------------
+
+I would print:
+
+``` cpp
+std::cerr
+    << "parents="
+    << frame.parents.size()
+    << " pidx="
+    << frame.pidx.size()
+    << "\n";
+```
+
+right before the crash point.
+
+I strongly suspect you'll get something like:
+
+``` text
+parents=1 pidx=0
+```
+
+or:
+
+``` text
+parents=5 pidx=0
+```
+
+------------------------------------------------------------------------
+
+Another issue:
+
+In my sketch I used aggregate initialization:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    std::vector<size_t>(
+        child_parents.size(),
+        0),
+    0,
+    path
+});
+```
+
+but your actual `TreeFrame` order may be:
+
+``` cpp
+struct TreeFrame
+{
+    git_tree *current;
+    std::vector<git_tree*> parents;
+
+    size_t cidx;
+
+    std::vector<size_t> pidx;
+
+    std::string root;
+};
+```
+
+instead of:
+
+``` cpp
+current
+parents
+pidx
+cidx
+root
+```
+
+If so, aggregate initialization silently assigns fields incorrectly.
+
+That would absolutely explain:
+
+``` text
+frame.pidx garbage
+```
+
+and an immediate segfault.
+
+------------------------------------------------------------------------
+
+I'd replace every aggregate construction with explicit assignments:
+
+``` cpp
+TreeFrame child;
+
+child.current = ctree;
+child.parents = std::move(child_parents);
+child.pidx.assign(
+    child.parents.size(),
+    0);
+child.cidx = 0;
+child.root = path;
+
+stack.push_back(std::move(child));
+```
+
+and likewise for the root frame:
+
+``` cpp
+TreeFrame root;
+
+root.current = root_current;
+root.parents = root_parents;
+root.pidx.assign(
+    root.parents.size(),
+    0);
+root.cidx = 0;
+root.root = root_path;
+
+stack.push_back(std::move(root));
+```
+
+------------------------------------------------------------------------
+
+Can you show:
+
+``` cpp
+struct TreeFrame
+{
+    ...
+};
+```
+
+and line ~1320 where it crashes?
+
+I'm pretty sure the crash is either:
+
+1.  `parents.size() != pidx.size()`, or
+2.  aggregate initialization doesn't match the actual field order.
+
+## Prompt:
+
+6/21/2026, 8:36:09 AM
+
+the aggregate initializations are correct.
+
+but the pidx size is zero at some point:
+
+    (gdb) r
+    Starting program: /home/user/src/milahu/git-file-times/debug-build/git-file-times 
+    [Thread debugging using libthread_db enabled]
+    Using host libthread_db library "/nix/store/fjkx1l5cnskzrqacf08z7i8z17256w0j-glibc-2.42-61/lib/libthread_db.so.1".
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=1
+    parents=1 pidx=0
+
+    Program received signal SIGSEGV, Segmentation fault.
+    0x0000555555556feb in compare_tree_nway (root_path="", root_current=<optimized out>, root_parents=std::vector of length 1, capacity 1 = {...}, 
+        ctx=0x555555712740) at /home/user/src/milahu/git-file-times/src/main.cpp:1328
+    1328                    if (get_entry(
+    (gdb) bt
+    #0  0x0000555555556feb in compare_tree_nway (root_path="", root_current=<optimized out>, root_parents=std::vector of length 1, capacity 1 = {...}, 
+        ctx=0x555555712740) at /home/user/src/milahu/git-file-times/src/main.cpp:1328
+    #1  main () at /home/user/src/milahu/git-file-times/src/main.cpp:1700
+
+## Response:
+
+6/21/2026, 8:36:17 AM
+
+Aha. Then the bug is almost certainly this line from my sketch:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    std::vector<size_t>(
+        child_parents.size(),
+        0),
+    0,
+    path
+});
+```
+
+The problem is evaluation order.
+
+You're doing:
+
+``` cpp
+std::move(child_parents)
+```
+
+and
+
+``` cpp
+child_parents.size()
+```
+
+in the same initializer expression.
+
+The order in which those arguments are evaluated is not something you should rely on.
+
+So one execution may effectively do:
+
+``` cpp
+size = child_parents.size();   // 1
+move(child_parents);
+```
+
+giving:
+
+``` text
+parents=1 pidx=1
+```
+
+while another may do:
+
+``` cpp
+move(child_parents);           // child_parents now empty
+size = child_parents.size();   // 0
+```
+
+giving:
+
+``` text
+parents=1 pidx=0
+```
+
+which is exactly what you're seeing.
+
+------------------------------------------------------------------------
+
+To verify, search for every occurrence of:
+
+``` cpp
+std::move(child_parents)
+```
+
+and replace with:
+
+``` cpp
+const size_t nparents =
+    child_parents.size();
+
+TreeFrame child{
+    ctree,
+    std::move(child_parents),
+    std::vector<size_t>(nparents, 0),
+    0,
+    path
+};
+
+stack.push_back(std::move(child));
+```
+
+or even more explicitly:
+
+``` cpp
+TreeFrame child;
+
+child.current = ctree;
+
+child.parents =
+    std::move(child_parents);
+
+child.pidx.assign(
+    child.parents.size(),
+    0);
+
+child.cidx = 0;
+
+child.root = path;
+
+stack.push_back(
+    std::move(child));
+```
+
+------------------------------------------------------------------------
+
+I'd also add an assertion immediately before every use:
+
+``` cpp
+assert(
+    frame.parents.size() ==
+    frame.pidx.size());
+```
+
+For example:
+
+``` cpp
+assert(
+    frame.parents.size() ==
+    frame.pidx.size());
+
+for (size_t pi = 0;
+     pi < frame.parents.size();
+     ++pi)
+{
+    ...
+}
+```
+
+That would have caught this instantly.
+
+------------------------------------------------------------------------
+
+So the crash is good news: it's not some deep tree-walking bug. It's almost certainly the moved-from `child_parents` vector causing a frame with:
+
+``` text
+parents=1
+pidx=0
+```
+
+which then crashes on:
+
+``` cpp
+frame.pidx[0]
+```
+
+## Prompt:
+
+6/21/2026, 8:47:58 AM
+
+ok, now this still runs out of memory. where should i free memory?
+
+## Response:
+
+6/21/2026, 8:48:04 AM
+
+The big question is: **what owns the `git_tree*`?**
+
+In the code sketch, every subtree lookup creates a new libgit2 object:
+
+``` cpp
+git_tree *ctree = nullptr;
+git_tree_lookup(&ctree, ctx->repo, coid);
+
+git_tree *ptree = nullptr;
+git_tree_lookup(&ptree, ctx->repo, poid);
+```
+
+Every successful lookup increments a libgit2 refcount and allocates a `git_tree`.
+
+If you never call:
+
+``` cpp
+git_tree_free(ctree);
+git_tree_free(ptree);
+```
+
+you leak.
+
+------------------------------------------------------------------------
+
+## Leak \#1: child parent trees
+
+You do:
+
+``` cpp
+child_parents.push_back(ptree);
+```
+
+and later:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    ...
+});
+```
+
+Now ownership of all those `ptree`s is inside the frame.
+
+When that frame finishes, you must free them.
+
+------------------------------------------------------------------------
+
+## Leak \#2: current subtree
+
+You also do:
+
+``` cpp
+git_tree_lookup(&ctree, ctx->repo, coid);
+```
+
+and push it into the frame:
+
+``` cpp
+frame.current = ctree;
+```
+
+That also must be freed.
+
+------------------------------------------------------------------------
+
+# Simple fix
+
+Add an ownership flag:
+
+``` cpp
+struct TreeFrame
+{
+    git_tree *current;
+
+    std::vector<git_tree*> parents;
+
+    std::vector<size_t> pidx;
+
+    size_t cidx;
+
+    std::string root;
+
+    bool owns_trees = false;
+};
+```
+
+Root frame:
+
+``` cpp
+TreeFrame root;
+
+root.current = root_current;
+root.parents = root_parents;
+
+root.owns_trees = false;
+```
+
+because those trees are owned by `main()`.
+
+Child frames:
+
+``` cpp
+TreeFrame child;
+
+child.current = ctree;
+child.parents = std::move(child_parents);
+
+child.owns_trees = true;
+```
+
+because we created them via `git_tree_lookup()`.
+
+Then when a frame finishes:
+
+``` cpp
+if (frame.owns_trees)
+{
+    git_tree_free(frame.current);
+
+    for (git_tree *p : frame.parents)
+        git_tree_free(p);
+}
+```
+
+------------------------------------------------------------------------
+
+# Better fix: RAII
+
+Instead of raw pointers:
+
+``` cpp
+struct TreePtr
+{
+    git_tree *ptr = nullptr;
+
+    TreePtr() = default;
+
+    explicit TreePtr(git_tree *p)
+        : ptr(p)
+    {
+    }
+
+    TreePtr(TreePtr&& other)
+        : ptr(other.ptr)
+    {
+        other.ptr = nullptr;
+    }
+
+    ~TreePtr()
+    {
+        if (ptr)
+            git_tree_free(ptr);
+    }
+};
+```
+
+Then:
+
+``` cpp
+std::vector<TreePtr>
+```
+
+and leaks become impossible.
+
+------------------------------------------------------------------------
+
+# But...
+
+I suspect the memory blowup is not only leaks.
+
+Look at nixpkgs.
+
+Suppose you recurse into:
+
+``` text
+pkgs/
+python-modules/
+...
+```
+
+for every commit.
+
+If each frame contains:
+
+``` cpp
+git_tree_lookup(...)
+```
+
+for every changed subtree,
+
+you may be allocating millions of tree objects over the whole run.
+
+Even if freed correctly, that's still expensive.
+
+------------------------------------------------------------------------
+
+# What Git does
+
+Git doesn't load subtrees eagerly.
+
+It walks tree entries lazily using iterators.
+
+That's why `git_diff_tree_to_tree()` scales.
+
+------------------------------------------------------------------------
+
+# What I would do
+
+Before worrying about caches, add counters:
+
+``` cpp
+static size_t trees_loaded = 0;
+static size_t trees_freed = 0;
+```
+
+Every lookup:
+
+``` cpp
+git_tree_lookup(...);
+trees_loaded++;
+```
+
+Every free:
+
+``` cpp
+git_tree_free(...);
+trees_freed++;
+```
+
+Print every 1000 commits:
+
+``` cpp
+std::cerr
+    << "loaded="
+    << trees_loaded
+    << " freed="
+    << trees_freed
+    << " alive="
+    << (trees_loaded - trees_freed)
+    << "\n";
+```
+
+If `alive` grows forever:
+
+``` text
+loaded=10000000
+freed=5000
+alive=9995000
+```
+
+you have a leak.
+
+If:
+
+``` text
+loaded=10000000
+freed=9999990
+alive=10
+```
+
+then the leak is fixed and the remaining problem is algorithmic cost.
+
+My guess is you're currently leaking every subtree frame, so `alive` will grow monotonically until OOM.
+
+## Prompt:
+
+6/21/2026, 9:06:25 AM
+
+> Then when a frame finishes:
+>
+> C++
+
+no, the memory usage still grows to 20GB after 17000 commits
+
+## Response:
+
+6/21/2026, 9:06:31 AM
+
+Ok, if it still grows to **20GB after 17000 commits**, then the issue is probably not just the missing `git_tree_free()`. There is a deeper ownership/lifetime problem in the stack algorithm.
+
+The important observation:
+
+Your `stack` contains frames. A frame contains:
+
+``` cpp
+git_tree *current;
+std::vector<git_tree*> parents;
+```
+
+A parent tree can be shared by many recursive frames. In a merge walk, this explodes:
+
+    commit tree
+     ├── subtree A
+     │    ├── parent subtree A1
+     │    └── parent subtree A2
+     ├── subtree B
+     │    ├── parent subtree B1
+     │    └── parent subtree B2
+    ...
+
+The same parent subtree may be loaded repeatedly.
+
+So the N-way version is accidentally doing:
+
+    git_tree_lookup()
+    git_tree_lookup()
+    git_tree_lookup()
+    ...
+
+millions of times.
+
+------------------------------------------------------------------------
+
+## First fix: free frames immediately after processing
+
+The `while` loop currently does:
+
+``` cpp
+while (!stack.empty())
+{
+    TreeFrame frame =
+        std::move(stack.back());
+
+    stack.pop_back();
+
+    while (true)
+    {
+        ...
+    }
+}
+```
+
+At the end of the inner loop you need:
+
+``` cpp
+if (frame.owns_trees)
+{
+    git_tree_free(frame.current);
+
+    for (auto *p : frame.parents)
+        git_tree_free(p);
+}
+```
+
+**inside the outer while**, after the inner loop finishes.
+
+Otherwise the moved frame dies, but its raw pointers don't.
+
+------------------------------------------------------------------------
+
+## But the 20GB number suggests this:
+
+You are probably keeping root commit trees alive.
+
+Look at `main`:
+
+``` cpp
+git_tree *tree;
+git_commit_tree(&tree, commit);
+```
+
+then:
+
+``` cpp
+compare_tree_nway(tree, ctx->parent_trees, ctx.get());
+```
+
+then:
+
+``` cpp
+git_tree_free(tree);
+```
+
+fine.
+
+But:
+
+``` cpp
+ctx->parent_trees
+```
+
+contains:
+
+``` cpp
+git_tree *ptree
+```
+
+from:
+
+``` cpp
+git_commit_tree(&ptree, parent);
+```
+
+Those are never freed before:
+
+``` cpp
+ctx->parent_trees.clear();
+```
+
+This is a leak.
+
+`clear()` destroys the vector, **not the git_tree objects**.
+
+Replace:
+
+``` cpp
+ctx->parent_trees.clear();
+```
+
+with:
+
+``` cpp
+for (auto *t : ctx->parent_trees)
+    git_tree_free(t);
+
+ctx->parent_trees.clear();
+```
+
+This alone may fix your 20GB.
+
+------------------------------------------------------------------------
+
+## Add this immediately
+
+At the top of the commit loop:
+
+``` cpp
+for (auto *t : ctx->parent_trees)
+{
+    git_tree_free(t);
+}
+
+ctx->parent_trees.clear();
+```
+
+before loading new parents.
+
+------------------------------------------------------------------------
+
+## Also: don't store parent trees in Context anymore
+
+The N-way function already receives:
+
+``` cpp
+std::vector<git_tree*> parents
+```
+
+So make `Context` not own them.
+
+Remove:
+
+``` cpp
+std::vector<git_tree*> parent_trees;
+```
+
+from `Context`.
+
+Use a local vector:
+
+``` cpp
+std::vector<git_tree*> parents;
+```
+
+in `main`.
+
+Then ownership is obvious:
+
+    main owns parents
+    compare_tree_nway borrows them
+    stack owns only temporary subtrees
+
+------------------------------------------------------------------------
+
+## Memory model should be:
+
+    commit loop:
+
+    load:
+      current tree
+      parent trees
+
+    compare:
+      stack frames
+      temporary subtree trees
+
+    free:
+      stack subtree trees
+      parent trees
+      current tree
+
+No tree survives one commit.
+
+------------------------------------------------------------------------
+
+I expect your 20GB will drop to something like a few hundred MB after fixing `ctx->parent_trees.clear()`. This is exactly the kind of leak that hides because everything is a raw `git_tree*`.
+
+## Prompt:
+
+6/21/2026, 9:48:27 AM
+
+> for (auto \*t : ctx-\>parent_trees)  
+> git_tree_free(t);
+
+no, it is still running out of memory
+
+`alive` just keeps growing and growing
+
+    [user@laptop:~/src/nixos/nixpkgs]$ /home/user/src/milahu/git-file-times/build/git-file-times 
+    stats: commits=100 time=0.633175 eta=600.02 commits/s=157.934 files_done=55 files/s=86.8638 deltas/s=0 progress=0.105414%
+      trees: loaded=250512 freed=1186 alive=249326
+    stats: commits=300 time=1.24702 eta=384.852 commits/s=325.814 files_done=138 files/s=135.213 deltas/s=0 progress=0.264494%
+      trees: loaded=974101 freed=3519 alive=970582
+    stats: commits=500 time=1.83821 eta=146.602 commits/s=338.304 files_done=347 files/s=353.528 deltas/s=0 progress=0.665069%
+      trees: loaded=1771955 freed=6259 alive=1765696
+    stats: commits=700 time=2.34259 eta=296.554 commits/s=396.524 files_done=435 files/s=174.471 deltas/s=0 progress=0.833733%
+      trees: loaded=2345220 freed=8489 alive=2336731
+    stats: commits=1000 time=3.20409 eta=266.048 commits/s=348.231 files_done=602 files/s=193.849 deltas/s=0 progress=1.15381%
+      trees: loaded=3309714 freed=12077 alive=3297637
+    stats: commits=1200 time=3.87711 eta=693.524 commits/s=297.167 files_done=652 files/s=74.2916 deltas/s=0 progress=1.24964%
+      trees: loaded=3962171 freed=14548 alive=3947623
+    stats: commits=1400 time=4.59161 eta=217.115 commits/s=279.916 files_done=821 files/s=236.529 deltas/s=0 progress=1.57355%
+      trees: loaded=4467159 freed=16971 alive=4450188
+    stats: commits=1600 time=5.54526 eta=319.137 commits/s=209.72 files_done=974 files/s=160.436 deltas/s=0 progress=1.86679%
+      trees: loaded=5101574 freed=19621 alive=5081953
+    stats: commits=1800 time=6.32277 eta=685.59 commits/s=257.231 files_done=1032 files/s=74.5971 deltas/s=0 progress=1.97796%
+      trees: loaded=5667242 freed=22049 alive=5645193
+    stats: commits=2000 time=6.99766 eta=382.836 commits/s=296.344 files_done=1122 files/s=133.355 deltas/s=0 progress=2.15046%
+      trees: loaded=6200806 freed=24439 alive=6176367
+    stats: commits=2200 time=8.5807 eta=689.175 commits/s=126.34 files_done=1239 files/s=73.9087 deltas/s=0 progress=2.3747%
+      trees: loaded=7178095 freed=26905 alive=7151190
+    stats: commits=2300 time=9.09575 eta=1639.17 commits/s=194.154 files_done=1255 files/s=31.0646 deltas/s=0 progress=2.40537%
+      trees: loaded=7652895 freed=28082 alive=7624813
+    stats: commits=2500 time=9.76454 eta=204.478 commits/s=299.051 files_done=1421 files/s=248.212 deltas/s=0 progress=2.72353%
+      trees: loaded=8278821 freed=30525 alive=8248296
+    stats: commits=2700 time=10.7003 eta=571.279 commits/s=213.729 files_done=1504 files/s=88.6974 deltas/s=0 progress=2.88261%
+      trees: loaded=9013032 freed=32884 alive=8980148
+
+relevant code
+
+``` cpp
+static void compare_tree_nway(
+    git_tree *root_current,
+    const std::vector<git_tree*> &root_parents,
+    const std::string &root_path, // not used
+    Context *ctx)
+{
+    std::vector<TreeFrame> stack;
+
+    stack.push_back({
+        root_current,
+        root_parents,
+        std::vector<size_t>(root_parents.size(), 0),
+        0,
+        "",
+        // trees are owned by main()
+        false
+    });
+
+    while (!stack.empty())
+    {
+        TreeFrame frame = std::move(stack.back());
+
+        stack.pop_back();
+
+        while (true)
+        {
+            const git_tree_entry *ce =
+                get_entry(
+                    frame.current,
+                    frame.cidx);
+
+            bool any_alive =
+                (ce != nullptr);
+
+            // debug segfault due to std::move(child_parents)
+            // std::cerr
+            //     << "parents="
+            //     << frame.parents.size()
+            //     << " pidx="
+            //     << frame.pidx.size()
+            //     << "\n";
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                if (get_entry(
+                        frame.parents[pi],
+                        frame.pidx[pi]))
+                {
+                    any_alive = true;
+                    break;
+                }
+            }
+
+            if (!any_alive)
+                break;
+
+            //
+            // find smallest name
+            //
+
+            const char *min_name = nullptr;
+
+            auto consider =
+                [&](const git_tree_entry *e)
+                {
+                    if (!e)
+                        return;
+
+                    const char *name =
+                        git_tree_entry_name(e);
+
+                    if (!min_name ||
+                        strcmp(name, min_name) < 0)
+                    {
+                        min_name = name;
+                    }
+                };
+
+            consider(ce);
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                consider(
+                    get_entry(
+                        frame.parents[pi],
+                        frame.pidx[pi]));
+            }
+
+            //
+            // current entry with this name?
+            //
+
+            bool current_has =
+                ce &&
+                strcmp(
+                    git_tree_entry_name(ce),
+                    min_name) == 0;
+
+            //
+            // matching parent entries
+            //
+
+            std::vector<const git_tree_entry*> matches(
+                frame.parents.size(),
+                nullptr);
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                auto *pe =
+                    get_entry(
+                        frame.parents[pi],
+                        frame.pidx[pi]);
+
+                if (pe &&
+                    strcmp(
+                        git_tree_entry_name(pe),
+                        min_name) == 0)
+                {
+                    matches[pi] = pe;
+                }
+            }
+
+            //
+            // process current entry
+            //
+
+            if (current_has)
+            {
+                git_object_t ctype =
+                    git_tree_entry_type(ce);
+
+                const git_oid *coid =
+                    git_tree_entry_id(ce);
+
+                std::string path =
+                    join_paths_3(
+                        frame.root,
+                        "",
+                        min_name);
+
+                bool identical_in_parent =
+                    false;
+
+                std::vector<git_tree*> child_parents;
+
+                for (size_t pi = 0;
+                     pi < matches.size();
+                     ++pi)
+                {
+                    auto *pe =
+                        matches[pi];
+
+                    if (!pe)
+                        continue;
+
+                    git_object_t ptype =
+                        git_tree_entry_type(pe);
+
+                    const git_oid *poid =
+                        git_tree_entry_id(pe);
+
+                    if (ptype != ctype)
+                        continue;
+
+                    if (git_oid_equal(
+                            poid,
+                            coid))
+                    {
+                        identical_in_parent =
+                            true;
+                    }
+
+                    if (ctype ==
+                        GIT_OBJECT_TREE)
+                    {
+                        git_tree *ptree =
+                            nullptr;
+
+                        git_tree_lookup(
+                            &ptree,
+                            ctx->repo,
+                            poid);
+                        trees_loaded++;
+
+                        child_parents.push_back(ptree);
+                    }
+                }
+
+                //
+                // blob
+                //
+
+                if (ctype ==
+                    GIT_OBJECT_BLOB)
+                {
+                    if (!identical_in_parent)
+                    {
+                        auto it =
+                            ctx->blobs.find(
+                                *coid);
+
+                        if (it !=
+                            ctx->blobs.end())
+                        {
+                            if (!it->second.has_time)
+                            {
+                                it->second.time =
+                                    ctx->time;
+
+                                it->second.has_time =
+                                    true;
+
+                                ctx->files_found++;
+                            }
+                        }
+                    }
+                }
+
+                //
+                // subtree
+                //
+
+                else if (
+                    ctype ==
+                    GIT_OBJECT_TREE)
+                {
+                    if (!identical_in_parent)
+                    {
+                        git_tree *ctree =
+                            nullptr;
+
+                        git_tree_lookup(
+                            &ctree,
+                            ctx->repo,
+                            coid);
+                        trees_loaded++;
+
+                        size_t nparents = child_parents.size();
+
+                        stack.push_back({
+                            ctree,
+                            std::move(child_parents),
+                            // no, this segfaults due to std::move(child_parents)
+                            // std::vector<size_t>(child_parents.size(), 0),
+                            std::vector<size_t>(nparents, 0),
+                            0,
+                            path,
+                            true
+                        });
+                    }
+                }
+            }
+
+            //
+            // advance iterators
+            //
+
+            if (current_has)
+                frame.cidx++;
+
+            for (size_t pi = 0;
+                 pi < matches.size();
+                 ++pi)
+            {
+                if (matches[pi])
+                    frame.pidx[pi]++;
+            }
+        }
+
+        if (frame.owns_trees)
+        {
+            git_tree_free(frame.current);
+            trees_freed++;
+            for (git_tree *p : frame.parents) {
+                git_tree_free(p);
+                trees_freed++;
+            }
+        }
+    }
+}
+
+int main() {
+    git_libgit2_init();
+
+    git_repository *repo = nullptr;
+    git_revwalk *walk = nullptr;
+
+    // open repo
+    if (git_repository_open(&repo, ".") != 0) {
+        std::cerr << "failed to open repo\n";
+        return 1;
+    }
+
+    // walk commits in repo
+    git_revwalk_new(&walk, repo);
+
+    // start walking at the HEAD commit
+    git_revwalk_push_head(walk);
+
+    // Topological order is not cache-friendly.
+    // git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL);
+    // git_revwalk_sorting(walk, GIT_SORT_TIME);
+    // git_revwalk_sorting(walk, GIT_SORT_REVERSE);
+    git_revwalk_sorting(walk, GIT_SORT_NONE);
+
+    // NOTE by default, git_revwalk visits all parents of merge commits
+    // only in the "simplify_first_parent" mode
+    // git_revwalk visits only the first parent of merge commits
+    // git_revwalk_simplify_first_parent(walk);
+
+    auto ctx = std::make_unique<Context>();
+
+    ctx->start_time = std::chrono::steady_clock::now();
+    ctx->last_print_time = ctx->start_time;
+
+    // ctx->remaining = collect_head_tree(repo);
+    ctx->blobs = collect_head_blobs(repo);
+
+    if (DEBUG) {
+        // std::cerr << "wanted blobs size: " << ctx->blobs.size() << "\n";
+        for (auto blob : ctx->blobs) {
+            // std::cerr << "wanted blob: " << git_oid_tostr_s(&blob.first) << " " << blob.second.path << "\n";
+        }
+    }
+
+    if (DEBUG) {
+        for (auto &[oid, info] : ctx->blobs) {
+            if (info.path == "ci.nix") {
+                std::cerr
+                    << "720: HEAD ci.nix blob="
+                    << git_oid_tostr_s(&oid)
+                    << "\n";
+            }
+        }
+    }
+
+    git_oid oid;
+
+    // loop commits
+    while (!git_revwalk_next(&oid, walk)) {
+
+        ctx->commits++;
+
+        if (ctx->commits % PRINT_STATS_EVERY_N_COMMITS == 0) {
+            print_stats(*ctx);
+        }
+
+        // std::cerr << "commit: " << git_oid_tostr_s(&oid) << "\n"; // debug
+
+        git_commit *commit;
+        git_commit_lookup(&commit, repo, &oid);
+
+        // // skip merge commits
+        // if (git_commit_parentcount(commit) > 1)
+        //     continue;
+
+        ctx->is_merge = git_commit_parentcount(commit) > 1;
+
+        if (DEBUG) {
+            if (ctx->is_merge) {
+                std::cerr << "760: commit=" << git_oid_tostr_s(&oid)
+                    << " parentcount=" << git_commit_parentcount(commit)
+                    << "\n";
+            }
+        }
+
+        // get parent trees
+        for (unsigned i = 0; i < git_commit_parentcount(commit); i++)
+        {
+            git_commit *parent = nullptr;
+            git_tree *ptree = nullptr;
+
+            git_commit_parent(&parent, commit, i);
+            git_commit_tree(&ptree, parent);
+            trees_loaded++;
+
+            ctx->parent_trees.push_back(ptree);
+
+            git_commit_free(parent);
+        }
+
+        git_time_t t = git_commit_time(commit);
+
+        git_tree *tree;
+        git_commit_tree(&tree, commit);
+        trees_loaded++;
+
+        git_tree *parent_tree = nullptr; // first parent
+
+        if (git_commit_parentcount(commit) > 0) {
+            // commit is not the root commit
+            git_commit *parent;
+            git_commit_parent(&parent, commit, 0);
+            git_commit_tree(&parent_tree, parent);
+            trees_loaded++;
+            git_commit_free(parent);
+        }
+
+        ctx->time = git_commit_time(commit);
+        ctx->oid = &oid;
+        ctx->commit = commit;
+        ctx->repo = repo;
+
+        git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
+        opts.flags |= GIT_DIFF_INCLUDE_UNTRACKED;
+
+        // if (ctx->is_merge) {
+        //     if (DEBUG) {
+        //         std::cerr << "800: calling compare_tree_merge\n";
+        //     }
+        //     // recursion
+        //     // FIXME avoid recursion
+        //     compare_tree_merge(tree, "", ctx.get());
+        // }
+        // else {
+        //     if (DEBUG) {
+        //         std::cerr << "810: calling compare_tree\n";
+        //     }
+
+        //     // FIXME we must call compare_tree with all parents
+        //     // in most cases, there is only one parent
+        //     // but merge commits have 2 (or more?) parents
+        //     // recursion
+        //     // FIXME avoid recursion
+        //     compare_tree(parent_tree, tree, "", "", ctx.get());
+        // }
+
+        compare_tree_nway(tree, ctx->parent_trees, "", ctx.get());
+
+        // free memory
+        // TODO cache trees and subtrees
+        if (parent_tree) {
+            git_tree_free(parent_tree);
+            trees_freed++;
+        }
+        for (auto *t : ctx->parent_trees) {
+            git_tree_free(t);
+            trees_freed++;
+        }
+        ctx->parent_trees.clear();
+        git_tree_free(tree);
+        trees_freed++;
+        git_commit_free(commit);
+
+        // // stop early
+        // if (ctx->remaining.empty())
+        //     break;
+    }
+
+    git_revwalk_free(walk);
+    git_repository_free(repo);
+
+    git_libgit2_shutdown();
+
+    // output result
+    for (const auto &kv : ctx->blobs) {
+        std::cout << kv.second.time << " " << kv.second.path << "\n";
+    }
+
+}
+```
+
+## Response:
+
+6/21/2026, 9:48:32 AM
+
+Ok, the counters make the bug obvious now.
+
+This is **not a leak in the stack frames**. Your `trees_freed` logic is mostly working. The problem is this:
+
+    loaded=9013032
+    freed =32884
+    alive =8980148
+
+You are creating ~**1000 new `git_tree` objects per commit**, but freeing only the top-level ones.
+
+The culprit is here:
+
+``` cpp
+if (ctype == GIT_OBJECT_TREE)
+{
+    git_tree *ptree = nullptr;
+
+    git_tree_lookup(
+        &ptree,
+        ctx->repo,
+        poid);
+
+    trees_loaded++;
+
+    child_parents.push_back(ptree);
+}
+```
+
+You are doing this for **every matching parent subtree**, even when the subtree is identical.
+
+Then later:
+
+``` cpp
+if (!identical_in_parent)
+{
+    ...
+    stack.push_back(...)
+}
+```
+
+If the subtree is identical, you throw away `child_parents` without freeing it.
+
+Example:
+
+    current:
+      src/
+
+    parent:
+      src/
+        same oid
+
+You do:
+
+    git_tree_lookup(src)
+    push child_parents
+    notice identical
+    do not recurse
+    forget child_parents
+
+The `git_tree*` leaks.
+
+------------------------------------------------------------------------
+
+## Fix 1: only lookup parent trees if you actually recurse
+
+Change:
+
+``` cpp
+if (ctype == GIT_OBJECT_TREE)
+{
+    git_tree *ptree = nullptr;
+
+    git_tree_lookup(
+        &ptree,
+        ctx->repo,
+        poid);
+
+    trees_loaded++;
+
+    child_parents.push_back(ptree);
+}
+```
+
+to:
+
+``` cpp
+if (ctype == GIT_OBJECT_TREE)
+{
+    if (!git_oid_equal(poid, coid))
+    {
+        git_tree *ptree = nullptr;
+
+        git_tree_lookup(
+            &ptree,
+            ctx->repo,
+            poid);
+
+        trees_loaded++;
+
+        child_parents.push_back(ptree);
+    }
+}
+```
+
+Because identical trees are exactly the case where you **do not descend**.
+
+------------------------------------------------------------------------
+
+## Fix 2: also free unused child_parents
+
+Even with the above, make this safe.
+
+Before:
+
+``` cpp
+else if (ctype == GIT_OBJECT_TREE)
+{
+    if (!identical_in_parent)
+    {
+        ...
+    }
+}
+```
+
+do:
+
+``` cpp
+else if (ctype == GIT_OBJECT_TREE)
+{
+    if (!identical_in_parent)
+    {
+        git_tree *ctree = nullptr;
+
+        git_tree_lookup(
+            &ctree,
+            ctx->repo,
+            coid);
+
+        trees_loaded++;
+
+        size_t nparents =
+            child_parents.size();
+
+        stack.push_back({
+            ctree,
+            std::move(child_parents),
+            std::vector<size_t>(nparents,0),
+            0,
+            path,
+            true
+        });
+    }
+    else
+    {
+        // we created parent trees but won't use them
+        for (auto *t : child_parents)
+        {
+            git_tree_free(t);
+            trees_freed++;
+        }
+    }
+}
+```
+
+------------------------------------------------------------------------
+
+## But there is another performance problem
+
+This part:
+
+``` cpp
+for (size_t pi = 0; pi < matches.size(); ++pi)
+{
+    auto *pe = get_entry(...);
+}
+```
+
+is fine.
+
+But this:
+
+``` cpp
+std::vector<const git_tree_entry*> matches(
+    frame.parents.size(),
+    nullptr);
+```
+
+allocates for every tree entry.
+
+For nixpkgs this is millions of allocations.
+
+Make it stack-ish:
+
+``` cpp
+std::vector<const git_tree_entry*> matches;
+matches.resize(frame.parents.size());
+```
+
+and reuse it inside `TreeFrame`.
+
+------------------------------------------------------------------------
+
+## After fix your counters should look like:
+
+Before:
+
+    commit 1000:
+    loaded 3.3M
+    freed 12k
+
+After:
+
+    commit 1000:
+    loaded maybe 50k
+    freed 50k
+    alive ~0
+
+The key insight:
+
+Your N-way algorithm was good, but you accidentally turned it into:
+
+    for every identical subtree:
+        load subtree
+        discard subtree
+
+which is the exact opposite of what Git does.
+
+The whole win of tree walking comes from:
+
+    compare OID first
+    only load subtree if OID differs
+
+That is the optimization we want.
+
+## Prompt:
+
+6/21/2026, 10:04:19 AM
+
+no. now the tree stats always say alive=0, and i have also added commit stats which also always say alive=0, but still, memory usage grows linearly over time, so we still have a memleak
+
+## Response:
+
+6/21/2026, 10:04:25 AM
+
+Good, that changes the diagnosis. If your own counters say:
+
+    trees alive = 0
+    commits alive = 0
+
+but RSS keeps growing, then the leak is probably **not libgit2 object ownership anymore**. The usual suspects now are:
+
+1.  **libgit2 internal caches**
+2.  **your STL containers growing capacity**
+3.  **blob/path/rename bookkeeping growing**
+4.  **allocator fragmentation**
+
+The first thing I would check: your `ctx->blobs`.
+
+You never remove entries:
+
+``` cpp
+auto it = ctx->blobs.find(*coid);
+if (it != ctx->blobs.end())
+{
+    if (!it->second.has_time)
+    {
+        it->second.time = ctx->time;
+        it->second.has_time = true;
+        ctx->files_found++;
+    }
+}
+```
+
+You are doing:
+
+    HEAD blobs = maybe 70k
+
+but your algorithm now discovers **every historical blob**.
+
+Every commit:
+
+    new blob oid
+      -> inserted somewhere
+      -> never removed
+
+So memory grows until you have every blob in nixpkgs history.
+
+Check:
+
+``` cpp
+std::cerr
+    << "blobs="
+    << ctx->blobs.size()
+    << "\n";
+```
+
+I bet this grows monotonically.
+
+------------------------------------------------------------------------
+
+Second: `std::vector` capacity in your frames.
+
+This is subtle:
+
+``` cpp
+std::vector<TreeFrame> stack;
+```
+
+The vector grows to the maximum depth/branching you hit.
+
+After that it keeps the memory.
+
+Do:
+
+``` cpp
+std::vector<TreeFrame>().swap(stack);
+```
+
+at the end of `compare_tree_nway`.
+
+------------------------------------------------------------------------
+
+Third: your `child_parents`
+
+This:
+
+``` cpp
+std::vector<git_tree*> child_parents;
+```
+
+allocates millions of tiny vectors.
+
+Use a small vector optimization or at least:
+
+``` cpp
+child_parents.reserve(frame.parents.size());
+```
+
+------------------------------------------------------------------------
+
+Fourth: libgit2 object cache
+
+This one is very likely.
+
+`git_tree_lookup()` loads objects through the ODB. Libgit2 keeps packfile windows and object caches.
+
+You can test:
+
+after every N commits:
+
+``` cpp
+git_odb *odb;
+git_repository_odb(&odb, repo);
+
+git_odb_refresh_memory(odb);
+
+git_odb_free(odb);
+```
+
+If memory stops growing: it was the ODB cache.
+
+------------------------------------------------------------------------
+
+Fifth: you are keeping `ctx->parent_trees` wrong
+
+I notice:
+
+``` cpp
+ctx->parent_trees.push_back(ptree);
+```
+
+then:
+
+``` cpp
+compare_tree_nway(tree, ctx->parent_trees,...)
+```
+
+then:
+
+``` cpp
+for (auto *t : ctx->parent_trees)
+{
+    git_tree_free(t);
+}
+```
+
+But your `compare_tree_nway` does this:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+...
+});
+```
+
+The frame owns child trees.
+
+However:
+
+``` cpp
+std::vector<TreeFrame> stack;
+```
+
+stores frames until processed.
+
+If a huge subtree produces thousands of frames, peak memory can be large.
+
+Use DFS instead:
+
+``` cpp
+while (!stack.empty())
+{
+    TreeFrame &frame = stack.back();
+
+    ...
+}
+```
+
+instead of:
+
+``` cpp
+TreeFrame frame = std::move(stack.back());
+stack.pop_back();
+```
+
+because the move destroys the vectors but does not necessarily release their heap allocations.
+
+------------------------------------------------------------------------
+
+But the fastest way to locate this:
+
+Run:
+
+``` cpp
+std::cerr
+ << "blobs=" << ctx->blobs.size()
+ << " stack=" << stack.size()
+ << " malloc=" << mallinfo2().uordblks
+ << "\n";
+```
+
+I expect `blobs.size()` is climbing.
+
+The symptom:
+
+    trees alive=0
+    commits alive=0
+    RSS grows linearly
+
+is almost always "application data structure grows", not a libgit2 leak.
+
+## Prompt:
+
+6/21/2026, 10:33:03 AM
+
+ctx-\>blobs has constant size  
+stack is mostly empty  
+but the malloc size keeps growing and growing
+
+    [user@laptop:~/src/nixos/nixpkgs]$ /home/user/src/milahu/git-file-times/build/git-file-times 
+    stats: commits=10000 time=14.9908 eta=158.204 commits/s=667.074 files_done=4516 files/s=301.251 deltas/s=0 progress=8.65549%
+      trees: loaded=802263 freed=802263 alive=0
+      commits: loaded=34371 freed=34371 alive=0
+      compare_tree_nway: blobs=52175 stack=0 malloc=209558272
+    stats: commits=20000 time=28.2945 eta=172.795 commits/s=751.674 files_done=7923 files/s=256.095 deltas/s=0 progress=15.1854%
+      trees: loaded=1764810 freed=1764810 alive=0
+      commits: loaded=69103 freed=69103 alive=0
+      compare_tree_nway: blobs=52175 stack=0 malloc=333765696
+    stats: commits=30000 time=44.7651 eta=225.835 commits/s=607.143 files_done=10931 files/s=182.629 deltas/s=0 progress=20.9506%
+      trees: loaded=2465305 freed=2465305 alive=0
+      commits: loaded=103332 freed=103332 alive=0
+      compare_tree_nway: blobs=52175 stack=0 malloc=423169008
+    stats: commits=40000 time=64.9982 eta=288.382 commits/s=494.239 files_done=13635 files/s=133.642 deltas/s=0 progress=26.1332%
+      trees: loaded=3379356 freed=3379356 alive=0
+      commits: loaded=137800 freed=137800 alive=0
+      compare_tree_nway: blobs=52175 stack=0 malloc=544121888
+    stats: commits=50000 time=82.0223 eta=218.14 commits/s=587.404 files_done=16425 files/s=163.886 deltas/s=0 progress=31.4806%
+      trees: loaded=4374548 freed=4374548 alive=0
+      commits: loaded=171974 freed=171974 alive=0
+      compare_tree_nway: blobs=52175 stack=0 malloc=631922480
+    stats: commits=60000 time=101.703 eta=65.7281 commits/s=508.1 files_done=24663 files/s=418.573 deltas/s=0 progress=47.2698%
+      trees: loaded=5494868 freed=5494868 alive=0
+      commits: loaded=205756 freed=205756 alive=0
+      compare_tree_nway: blobs=52175 stack=0 malloc=759359040
+
+should i use some memory profiler to debug this? valgrind?
+
+## Response:
+
+6/21/2026, 10:33:09 AM
+
+This is actually a very useful datapoint. Your counters prove the `git_tree*` and `git_commit*` lifetimes are balanced. The pattern:
+
+    trees alive=0
+    commits alive=0
+    stack=0
+    ctx->blobs constant
+    malloc: 200MB -> 700MB+
+
+means the memory is probably **not leaked objects**, but **allocator-resident memory that is not returned to the OS** or some other libgit2-owned cache.
+
+Before jumping to valgrind, I would do two quick tests.
+
+------------------------------------------------------------------------
+
+## 1. Check if this is malloc arena growth
+
+glibc malloc normally does not give freed memory back to the kernel. A program can show:
+
+    malloc() usage growing
+
+even when there is no leak.
+
+Try adding:
+
+``` cpp
+#include <malloc.h>
+```
+
+and after every N commits:
+
+``` cpp
+malloc_trim(0);
+```
+
+Example:
+
+``` cpp
+if (ctx->commits % 10000 == 0) {
+    malloc_trim(0);
+}
+```
+
+If RSS suddenly drops, you do **not** have a leak.
+
+------------------------------------------------------------------------
+
+## 2. libgit2 ODB cache is a prime suspect
+
+You are doing millions of:
+
+``` cpp
+git_tree_lookup()
+```
+
+Each lookup loads an object through the ODB.
+
+libgit2 caches:
+
+- decompressed objects
+- pack windows
+- delta bases
+- mmap regions
+
+Your counters don't see those.
+
+Test:
+
+``` cpp
+git_odb *odb;
+
+git_repository_odb(&odb, repo);
+
+git_odb_refresh_memory(odb);
+
+git_odb_free(odb);
+```
+
+Put this in the loop:
+
+``` cpp
+if (ctx->commits % 5000 == 0)
+    git_odb_refresh_memory(odb);
+```
+
+If growth stops, we found it.
+
+------------------------------------------------------------------------
+
+## 3. I see another possible hidden allocation: `git_tree_entry_name`
+
+You are doing millions of:
+
+``` cpp
+strcmp(
+    git_tree_entry_name(pe),
+    min_name)
+```
+
+Normally fine.
+
+But this:
+
+``` cpp
+std::string path =
+    join_paths_3(...)
+```
+
+is suspicious.
+
+How big is your path storage?
+
+You said:
+
+    ctx->blobs constant
+
+but what about:
+
+``` cpp
+BlobInfo.path
+```
+
+or rename tracking?
+
+Print:
+
+``` cpp
+size_t total = 0;
+
+for (auto &[oid, info] : ctx->blobs)
+    total += info.path.capacity();
+
+std::cerr << "path capacity=" << total << "\n";
+```
+
+`std::string` capacity never shrinks.
+
+------------------------------------------------------------------------
+
+## 4. Use a real leak checker, but not valgrind first
+
+Valgrind will be extremely slow here.
+
+Use:
+
+### heaptrack
+
+On NixOS probably:
+
+``` bash
+nix-shell -p heaptrack
+```
+
+then:
+
+``` bash
+heaptrack ./git-file-times
+```
+
+Open:
+
+``` bash
+heaptrack_gui heaptrack.*.gz
+```
+
+It will immediately show:
+
+    libgit2:
+      git_object_lookup
+      git_odb_read
+      malloc
+
+    or
+
+    std::string::_M_construct
+
+------------------------------------------------------------------------
+
+## 5. My bet: ODB cache + pack cache
+
+The growth rate matches:
+
+    10000 commits -> 200 MB
+    60000 commits -> 760 MB
+
+That is approximately:
+
+    ~10 KB / commit
+
+which is exactly plausible for cached Git objects.
+
+Your old recursive version probably did fewer `git_tree_lookup()` calls.
+
+Count:
+
+``` cpp
+std::cerr
+ << "tree lookups="
+ << trees_loaded
+ << "\n";
+```
+
+You have:
+
+    5.5 million tree lookups at 60k commits
+
+libgit2 may be keeping those objects.
+
+------------------------------------------------------------------------
+
+## One more experiment
+
+Run with:
+
+``` bash
+GIT_OBJECT_CACHE_SIZE=0 ./git-file-times
+```
+
+(libgit2 honors some ODB cache settings depending on version)
+
+or in code:
+
+``` cpp
+git_libgit2_opts(
+    GIT_OPT_SET_CACHE_MAX_SIZE,
+    0);
+```
+
+before opening the repo.
+
+------------------------------------------------------------------------
+
+I would do in this order:
+
+1.  add `malloc_trim(0)` → determine allocator vs real leak
+2.  call `git_libgit2_opts(GIT_OPT_SET_CACHE_MAX_SIZE,0)`
+3.  run heaptrack
+
+My suspicion is **not your code anymore**. The N-way walker is doing exactly the kind of access pattern that makes libgit2's object cache explode.
+
+## Prompt:
+
+6/21/2026, 10:40:36 AM
+
+> - call `git_libgit2_opts(GIT_OPT_SET_CACHE_MAX_SIZE,0)`
+
+Convert to writing block
+
+## Response:
+
+6/21/2026, 10:40:42 AM
+
+\*\*standard: \*\*
+
+call `git_libgit2_opts(GIT_OPT_SET_CACHE_MAX_SIZE,0)`
+
+## Prompt:
+
+6/21/2026, 10:58:38 AM
+
+> ### heaptrack
+
+most memory allocations  
+main: 230M allocations  
+join_paths_3: 125M allocations  
+git\_\_calloc: 11M allocations  
+git\_\_reallocarray: 5M allocations
+
+most temporary allocations:  
+main: 76M allocations  
+git\_\_reallocarray: 4M allocations  
+git\_\_calloc: 1M allocations
+
+largest memory leaks:  
+git_delta_apply: 37MB  
+git\_\_calloc: 32MB  
+collect_head_blobs: 8MB  
+git\_\_reallocarray: 3MB
+
+peak contributions:  
+git_delta_apply: 37MB  
+git\_\_calloc: 32MB  
+collect_head_blobs: 8MB  
+git\_\_reallocarray: 3MB
+
+so main and join_paths_3 look bad... but why?
+
+## Response:
+
+6/21/2026, 10:58:38 AM
+
+The heaptrack result changes the diagnosis quite a bit. The big clue is:
+
+    main:          230M allocations
+    join_paths_3: 125M allocations
+    git__calloc:   11M allocations
+
+This does **not** look like a libgit2 object leak. It looks like you are creating an enormous amount of temporary C++ heap garbage.
+
+`main` being huge usually means allocations from things inside your main loop that are not inlined/symbolized, especially:
+
+``` cpp
+std::string
+std::vector
+unordered_map operations
+```
+
+The smoking gun is probably:
+
+``` cpp
+std::string path =
+    join_paths_3(
+        frame.root,
+        "",
+        min_name);
+```
+
+You call this for basically every tree entry you visit.
+
+In your algorithm you are doing millions of:
+
+    tree entry
+     -> allocate std::string
+     -> copy path
+     -> hash/find
+     -> destroy string
+
+Even if the string dies immediately, glibc keeps the freed memory in arenas, so RSS grows.
+
+------------------------------------------------------------------------
+
+### First fix: do not build paths unless needed
+
+This:
+
+``` cpp
+std::string path =
+    join_paths_3(
+        frame.root,
+        "",
+        min_name);
+```
+
+should move down.
+
+You only need a path for:
+
+- blob that is in `ctx->blobs`
+- rename tracking
+- output
+
+So:
+
+``` cpp
+if (ctype == GIT_OBJECT_BLOB)
+{
+    auto it = ctx->blobs.find(*coid);
+
+    if (it != ctx->blobs.end())
+    {
+        std::string path =
+            join_paths_3(
+                frame.root,
+                "",
+                min_name);
+
+        ...
+    }
+}
+```
+
+Most tree entries are directories or blobs you don't care about.
+
+------------------------------------------------------------------------
+
+### Second: make join_paths_3 return into a buffer
+
+Instead of:
+
+``` cpp
+std::string join_paths_3(
+    const std::string &a,
+    const std::string &b,
+    const char *c)
+```
+
+which allocates every call,
+
+use:
+
+``` cpp
+void join_paths_3(
+    std::string &out,
+    const std::string &a,
+    const char *c)
+{
+    out.clear();
+
+    out.reserve(
+        a.size() + strlen(c) + 2);
+
+    out += a;
+
+    if (!out.empty())
+        out += '/';
+
+    out += c;
+}
+```
+
+Then:
+
+``` cpp
+std::string path;
+
+join_paths_3(
+    path,
+    frame.root,
+    min_name);
+```
+
+Now one allocation per frame, not per entry.
+
+------------------------------------------------------------------------
+
+### Third: your `std::vector` allocations
+
+This:
+
+``` cpp
+std::vector<const git_tree_entry*> matches(
+    frame.parents.size(),
+    nullptr);
+```
+
+runs inside the inner loop.
+
+So for every filename:
+
+    allocate vector
+    allocate memory
+    fill
+    destroy
+
+Replace with stack storage:
+
+``` cpp
+std::vector<const git_tree_entry*> matches;
+matches.resize(frame.parents.size());
+```
+
+outside the loop.
+
+Or better:
+
+``` cpp
+std::array<const git_tree_entry*, 8>
+```
+
+if your merge parent count is small.
+
+------------------------------------------------------------------------
+
+### Fourth: this is probably terrible
+
+``` cpp
+std::vector<git_tree*> child_parents;
+```
+
+inside every entry.
+
+Do:
+
+``` cpp
+std::vector<git_tree*> child_parents;
+child_parents.reserve(frame.parents.size());
+```
+
+------------------------------------------------------------------------
+
+### Fifth: the `git_delta_apply` "leak"
+
+This:
+
+    git_delta_apply: 37MB
+
+is probably packfile delta memory.
+
+Not concerning unless it grows forever.
+
+------------------------------------------------------------------------
+
+I would expect that after only these two changes:
+
+1.  move `join_paths_3` inside the blob-interest check
+2.  reuse a `std::string` buffer
+
+your RSS growth disappears.
+
+The algorithm is probably fine. You accidentally turned a tree walker into a **path-string allocation benchmark**. 🙂
+
+## Prompt:
+
+6/21/2026, 1:31:41 PM
+
+ok, i guess the "memory leak" is caused by buffers in libgit2... for nixpkgs, the .git directory has 7GB, and my git-file-times has a max_rss of about 1GB, which apparently is mostly caused by parsing/decoding/decompressing git packfiles and git deltas... so not much i can do there...
+
+i am trying to understand your algorithm with min_name, consider, current_has, matches, ... but it does not make much sense to me. what i would do in this situation, is to do a "merge walk" of the current tree and all parent trees, in that i would walk the entries of the current tree, and try to find entries with the same name in the parent trees. if a parent tree has more entries, then it should emit "delete entry" events for all extra entries in the parent tree. if a parent has less entries, it should emit "add entry" events for each missing entry in the parent tree. but it should always try to keep the parent tree indices frame.pidx\[pi\] in sync, so that all indices point to the same entry name, except when the parent tree has no entry with the current entry name, then that tree index points to the next entry in the parent tree, and matches\[pi\]==nullptr in that case. if a parent tree has an entry with the same name as the current entry, then the parent entry is in matches\[pi\]
+
+your last version is advancing all iterators in frame.pidx\[pi\] in every loop iteration, but that means the trees can run out-of-sync over time...
+
+``` cpp
+            //
+            // advance iterators
+            //
+
+            if (current_has)
+                frame.cidx++;
+
+            for (size_t pi = 0; pi < matches.size(); ++pi)
+            {
+                if (matches[pi])
+                    frame.pidx[pi]++;
+            }
+```
+
+try to fix your compare_tree_nway function
+
+## Response:
+
+6/21/2026, 1:31:41 PM
+
+You're right. Looking at it again, my `min_name` implementation is effectively an N-way merge of sorted name streams, but it is not preserving the semantics you actually want.
+
+Your mental model is:
+
+``` text
+current tree = master stream
+
+for each parent tree:
+    keep parent index aligned to current index
+    emit delete events for extra parent entries
+    emit add events for missing parent entries
+    emit match events for same-name entries
+```
+
+That's much closer to how `git_diff_tree_to_tree()` works internally.
+
+The bug in my version is that it chooses the globally smallest name:
+
+``` cpp
+min_name = min(
+    current_name,
+    parent0_name,
+    parent1_name,
+    ...
+);
+```
+
+and then advances every matching iterator.
+
+That computes a union of names across all trees.
+
+What you want is different:
+
+``` cpp
+for each current entry:
+    synchronize every parent tree
+    against current_name
+```
+
+so the current tree drives the walk.
+
+------------------------------------------------------------------------
+
+For a given current entry:
+
+``` cpp
+ce = current[cidx]
+cname = git_tree_entry_name(ce)
+```
+
+each parent should be synchronized independently:
+
+``` cpp
+while (parent_name < cname)
+{
+    emit_delete(parent_entry);
+    pidx++;
+}
+
+if (parent_name == cname)
+{
+    matches[pi] = parent_entry;
+    pidx++;
+}
+else
+{
+    matches[pi] = nullptr;
+}
+```
+
+Notice that we advance parent indices only as much as necessary to catch up to the current name.
+
+This keeps all parent streams aligned to the current stream.
+
+Pseudo-code:
+
+``` cpp
+for each current entry ce
+{
+    cname = ce->name;
+
+    matches.clear();
+
+    for each parent pi
+    {
+        while (true)
+        {
+            pe = parent[pidx];
+
+            if (!pe)
+                break;
+
+            cmp = strcmp(pe->name, cname);
+
+            if (cmp < 0)
+            {
+                emit_delete(pe);
+                pidx++;
+                continue;
+            }
+
+            if (cmp == 0)
+            {
+                matches[pi] = pe;
+                pidx++;
+            }
+
+            break;
+        }
+    }
+
+    process_current_entry(
+        ce,
+        matches);
+
+    cidx++;
+}
+```
+
+Then after current tree is exhausted:
+
+``` cpp
+for each parent pi
+{
+    while (pe = parent[pidx])
+    {
+        emit_delete(pe);
+        pidx++;
+    }
+}
+```
+
+This is exactly the missing step in my version.
+
+------------------------------------------------------------------------
+
+The nice property is:
+
+``` text
+current: a b c d
+
+parent:  a x y c z
+```
+
+walk:
+
+``` text
+a -> match(a)
+
+b -> delete(x)
+     delete(y)
+     add(b)
+
+c -> match(c)
+
+d -> delete(z)
+     add(d)
+```
+
+which is precisely a diff-style merge walk.
+
+------------------------------------------------------------------------
+
+For N parents:
+
+``` cpp
+matches[pi]
+```
+
+means:
+
+``` text
+nullptr      => parent does not contain this name
+entry*       => parent contains same name
+```
+
+and after synchronization every parent index points at:
+
+``` text
+next name > current_name
+```
+
+which preserves alignment.
+
+------------------------------------------------------------------------
+
+I would actually throw away the `min_name` machinery completely.
+
+For your use case:
+
+``` text
+HEAD blobs are the only blobs we care about
+```
+
+the optimal traversal is:
+
+``` text
+walk current tree
+synchronize all parent trees to current names
+process current entry
+```
+
+because deletions only matter as rename candidates, and rename detection can be handled separately via:
+
+``` cpp
+deleted_blob_oid -> old_path
+added_blob_oid   -> new_path
+```
+
+during synchronization.
+
+That makes the algorithm much closer to a generalized version of the old `compare_tree(parent,current)` that you already know works.
+
+## Prompt:
+
+6/21/2026, 1:34:07 PM
+
+> I would actually throw away the `min_name` machinery completely.
+
+yes, lets throw away the min_name machinery.  
+give me a full compare_tree_nway function
+
+## Response:
+
+6/21/2026, 1:34:08 PM
+
+Yes. I think the `min_name` version was the wrong abstraction for your problem.
+
+What you actually want is:
+
+``` text
+current tree drives the walk
+
+for each current entry:
+    synchronize every parent tree to current entry name
+
+    parent name < current name
+        => deletion in that parent
+
+    parent name == current name
+        => match
+
+    parent name > current name
+        => current entry missing in that parent
+```
+
+which is exactly a generalized tree-vs-tree merge walk.
+
+Something like this:
+
+``` cpp
+static void compare_tree_nway(
+    git_tree *root_current,
+    const std::vector<git_tree*> &root_parents,
+    const std::string &root_path,
+    Context *ctx)
+{
+    std::vector<TreeFrame> stack;
+
+    stack.push_back({
+        root_current,
+        root_parents,
+        std::vector<size_t>(root_parents.size(), 0),
+        0,
+        root_path,
+        false // root trees owned by caller
+    });
+
+    while (!stack.empty())
+    {
+        TreeFrame frame = std::move(stack.back());
+        stack.pop_back();
+
+        const size_t current_n =
+            git_tree_entrycount(frame.current);
+
+        while (frame.cidx < current_n)
+        {
+            const git_tree_entry *ce =
+                git_tree_entry_byindex(
+                    frame.current,
+                    frame.cidx);
+
+            const char *cname =
+                git_tree_entry_name(ce);
+
+            git_object_t ctype =
+                git_tree_entry_type(ce);
+
+            const git_oid *coid =
+                git_tree_entry_id(ce);
+
+            //
+            // synchronize parent indices
+            //
+
+            std::vector<const git_tree_entry*> matches(
+                frame.parents.size(),
+                nullptr);
+
+            for (size_t pi = 0;
+                 pi < frame.parents.size();
+                 ++pi)
+            {
+                git_tree *parent =
+                    frame.parents[pi];
+
+                const size_t parent_n =
+                    git_tree_entrycount(parent);
+
+                while (frame.pidx[pi] < parent_n)
+                {
+                    const git_tree_entry *pe =
+                        git_tree_entry_byindex(
+                            parent,
+                            frame.pidx[pi]);
+
+                    const char *pname =
+                        git_tree_entry_name(pe);
+
+                    int cmp =
+                        strcmp(
+                            pname,
+                            cname);
+
+                    if (cmp < 0)
+                    {
+                        //
+                        // delete event
+                        //
+
+                        // TODO:
+                        // rename tracking:
+                        //
+                        // deleted blob oid
+                        // deleted path
+
+                        frame.pidx[pi]++;
+                        continue;
+                    }
+
+                    if (cmp == 0)
+                    {
+                        matches[pi] = pe;
+
+                        frame.pidx[pi]++;
+
+                        break;
+                    }
+
+                    //
+                    // cmp > 0
+                    //
+                    // current entry missing
+                    // in this parent
+                    //
+
+                    break;
+                }
+            }
+
+            //
+            // process current entry
+            //
+
+            std::string path =
+                frame.root.empty()
+                ? std::string(cname)
+                : frame.root + "/" + cname;
+
+            bool identical_in_any_parent =
+                false;
+
+            std::vector<git_tree*> child_parents;
+
+            if (ctype == GIT_OBJECT_TREE)
+            {
+                child_parents.reserve(
+                    matches.size());
+            }
+
+            for (size_t pi = 0;
+                 pi < matches.size();
+                 ++pi)
+            {
+                const git_tree_entry *pe =
+                    matches[pi];
+
+                if (!pe)
+                    continue;
+
+                git_object_t ptype =
+                    git_tree_entry_type(pe);
+
+                if (ptype != ctype)
+                    continue;
+
+                const git_oid *poid =
+                    git_tree_entry_id(pe);
+
+                if (git_oid_equal(
+                        poid,
+                        coid))
+                {
+                    identical_in_any_parent =
+                        true;
+                }
+
+                if (ctype == GIT_OBJECT_TREE)
+                {
+                    git_tree *ptree =
+                        nullptr;
+
+                    git_tree_lookup(
+                        &ptree,
+                        ctx->repo,
+                        poid);
+
+                    child_parents.push_back(
+                        ptree);
+                }
+            }
+
+            //
+            // blob
+            //
+
+            if (ctype == GIT_OBJECT_BLOB)
+            {
+                if (!identical_in_any_parent)
+                {
+                    auto it =
+                        ctx->blobs.find(
+                            *coid);
+
+                    if (it != ctx->blobs.end())
+                    {
+                        if (!it->second.has_time)
+                        {
+                            it->second.time =
+                                ctx->time;
+
+                            it->second.has_time =
+                                true;
+
+                            ctx->files_found++;
+                        }
+                    }
+                }
+            }
+
+            //
+            // subtree
+            //
+
+            else if (
+                ctype ==
+                GIT_OBJECT_TREE)
+            {
+                if (!identical_in_any_parent)
+                {
+                    git_tree *ctree =
+                        nullptr;
+
+                    git_tree_lookup(
+                        &ctree,
+                        ctx->repo,
+                        coid);
+
+                    stack.push_back({
+                        ctree,
+                        std::move(child_parents),
+                        std::vector<size_t>(
+                            child_parents.size(),
+                            0),
+                        0,
+                        path,
+                        true
+                    });
+                }
+                else
+                {
+                    for (git_tree *t : child_parents)
+                    {
+                        git_tree_free(t);
+                    }
+                }
+            }
+
+            frame.cidx++;
+        }
+
+        //
+        // flush remaining parent entries
+        //
+
+        for (size_t pi = 0;
+             pi < frame.parents.size();
+             ++pi)
+        {
+            git_tree *parent =
+                frame.parents[pi];
+
+            const size_t parent_n =
+                git_tree_entrycount(parent);
+
+            while (frame.pidx[pi] < parent_n)
+            {
+                const git_tree_entry *pe =
+                    git_tree_entry_byindex(
+                        parent,
+                        frame.pidx[pi]);
+
+                //
+                // delete event
+                //
+
+                // TODO:
+                // rename tracking
+
+                frame.pidx[pi]++;
+            }
+        }
+
+        //
+        // free owned trees
+        //
+
+        if (frame.owns_trees)
+        {
+            git_tree_free(
+                frame.current);
+
+            for (git_tree *t :
+                 frame.parents)
+            {
+                git_tree_free(t);
+            }
+        }
+    }
+}
+```
+
+A few important observations:
+
+1.  Parent indices only move forward.
+2.  Current tree is the master stream.
+3.  No `min_name`.
+4.  No parent tree ever gets out of sync because each parent is independently advanced until `pname >= cname`.
+5.  Identical subtrees are skipped completely:
+
+``` cpp
+if (git_oid_equal(poid, coid))
+    identical_in_any_parent = true;
+```
+
+which preserves the huge optimization you wanted.
+
+The next thing I'd add is explicit rename tracking:
+
+``` cpp
+deleted_blobs[blob_oid].push_back(old_path);
+added_blobs[blob_oid].push_back(new_path);
+```
+
+from the delete/add events, because that fits naturally into this walk. Right now the function only detects modifications/additions, not renames.
+
+## Prompt:
+
+6/21/2026, 1:43:14 PM
+
+weird... this segfaults at the function call to compare_tree_nway
+
+    Program received signal SIGSEGV, Segmentation fault.
+    0x00005555555571dd in compare_tree_nway (root_current=<optimized out>, root_parents=std::vector of length 1, capacity 1 = {...}, root_path="", 
+        ctx=0x555555711740) at /nix/store/sanx9fg8mry8mq92zhlm5qvb83qlxrlx-gcc-15.2.0/include/c++/15.2.0/bits/stl_vector.h:1263
+    1263            __glibcxx_requires_subscript(__n);
+    (gdb) bt
+    #0  0x00005555555571dd in compare_tree_nway (root_current=<optimized out>, root_parents=std::vector of length 1, capacity 1 = {...}, root_path="", 
+        ctx=0x555555711740) at /nix/store/sanx9fg8mry8mq92zhlm5qvb83qlxrlx-gcc-15.2.0/include/c++/15.2.0/bits/stl_vector.h:1263
+    #1  main () at /home/user/src/milahu/git-file-times/src/main.cpp:2082
+
+i have checked `ctx->parent_trees.size()` which is 1
+
+ideas...? this is surprising, because the function signature and function header are almost identical to the previous version
+
+## Response:
+
+6/21/2026, 1:43:15 PM
+
+This is a classic symptom of a moved-from vector being accessed later.
+
+The backtrace:
+
+``` text
+stl_vector.h:1263
+__glibcxx_requires_subscript(__n);
+```
+
+means somebody did:
+
+``` cpp
+vec[i]
+```
+
+when
+
+``` cpp
+vec.size() == 0
+```
+
+(or `i >= size()` in a debug STL build).
+
+The interesting part is:
+
+``` text
+Program received signal SIGSEGV in compare_tree_nway()
+```
+
+not at the call site.
+
+So the function itself has already started executing.
+
+------------------------------------------------------------------------
+
+The first thing I'd inspect is:
+
+``` cpp
+TreeFrame frame = std::move(stack.back());
+```
+
+because later you do:
+
+``` cpp
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    std::vector<size_t>(
+        child_parents.size(),
+        0),
+    0,
+    path,
+    true
+});
+```
+
+This is a bug.
+
+After:
+
+``` cpp
+std::move(child_parents)
+```
+
+the vector is moved-from.
+
+Then you do:
+
+``` cpp
+child_parents.size()
+```
+
+which is legal but unspecified.
+
+Most STL implementations leave it as:
+
+``` cpp
+size() == 0
+```
+
+So you're effectively doing:
+
+``` cpp
+parents = moved vector containing N trees
+pidx    = vector<size_t>(0, 0)
+```
+
+Later:
+
+``` cpp
+frame.parents.size() == N
+frame.pidx.size()    == 0
+```
+
+Then:
+
+``` cpp
+frame.pidx[pi]
+```
+
+boom.
+
+------------------------------------------------------------------------
+
+You had exactly this bug earlier and fixed it once with:
+
+``` cpp
+size_t nparents =
+    child_parents.size();
+
+stack.push_back({
+    ctree,
+    std::move(child_parents),
+    std::vector<size_t>(nparents, 0),
+    ...
+});
+```
+
+Make sure that version didn't get lost.
+
+------------------------------------------------------------------------
+
+Another possibility:
+
+The root frame itself.
+
+Check immediately after:
+
+``` cpp
+stack.push_back({
+    root_current,
+    root_parents,
+    std::vector<size_t>(root_parents.size(), 0),
+    0,
+    root_path,
+    false
+});
+```
+
+Add:
+
+``` cpp
+assert(
+    stack.back().parents.size() ==
+    stack.back().pidx.size());
+```
+
+and also after every child push:
+
+``` cpp
+assert(
+    stack.back().parents.size() ==
+    stack.back().pidx.size());
+```
+
+I strongly suspect one of those asserts will fire.
+
+------------------------------------------------------------------------
+
+If not, put this at the top of the loop:
+
+``` cpp
+assert(
+    frame.parents.size() ==
+    frame.pidx.size());
+```
+
+before any access to:
+
+``` cpp
+frame.pidx[pi]
+```
+
+That will tell you exactly which frame became corrupted.
+
+------------------------------------------------------------------------
+
+My money is on this line:
+
+``` cpp
+std::vector<size_t>(
+    child_parents.size(),
+    0)
+```
+
+after `std::move(child_parents)`.
+
+That's exactly the pattern that produced your earlier:
+
+``` text
+parents=1 pidx=0
+```
+
+debug output.
+
+## Prompt:
+
+6/21/2026, 5:25:15 PM
+
+i have modified your function a bit...
+
+i have renamed `child_parents` to `next_ptrees`
+
+in line 128 i changed  
+`if (ctype == GIT_OBJECT_TREE)`  
+to  
+`if (ptype == GIT_OBJECT_TREE)`  
+because in the following block, pe is resolved to a git_tree
+
+in line 99 i have added the bool `identical_in_all_parents` but i guess this is not needed for my goal... or is it? currently i still have some knot in my head around the question: when do i have to push a new frame to the stack? and which next_ptrees do i have to pass as the new frame's frame.parents? and what should happen on type changes? for example when ce is a blob but some pe is a tree, or vice versa? remember, i have to track renames, because i do not want to treat renames as "file was modified", so the next step will be to track "add entry" and "delete entry" events. so i guess i already have an answer to my "head-knot question": on type change, we can defer recursion into subtrees by emitting "add" and "delete" events, and then at the end of the current stack iteration, we try to pair "add blob" and "delete blob" events, so only then we eventually have to recurse into subtrees... right?
+
+``` cpp
+static void compare_tree_nway(
+    git_tree *root_current,
+    const std::vector<git_tree*> &root_parents,
+    const std::string &root_path,
+    Context *ctx)
+{
+    std::vector<TreeFrame> stack;
+
+    stack.push_back({
+        root_current,
+        root_parents,
+        std::vector<size_t>(root_parents.size(), 0),
+        0,
+        root_path,
+        false // root trees owned by caller
+    });
+
+    while (!stack.empty())
+    {
+        TreeFrame frame = std::move(stack.back());
+        stack.pop_back();
+
+        const size_t current_n =
+            git_tree_entrycount(frame.current);
+
+        // walk current tree entries
+        while (frame.cidx < current_n)
+        {
+            const git_tree_entry *ce =
+                git_tree_entry_byindex(
+                    frame.current,
+                    frame.cidx);
+
+            const char *cname =
+                git_tree_entry_name(ce);
+
+            git_object_t ctype =
+                git_tree_entry_type(ce);
+
+            const git_oid *coid =
+                git_tree_entry_id(ce);
+
+            //
+            // synchronize parent indices
+            //
+
+            // entries with identical names
+            std::vector<const git_tree_entry*> matches(frame.parents.size(), nullptr);
+
+            // walk parent trees
+            for (size_t pi = 0; pi < frame.parents.size(); ++pi)
+            {
+                git_tree *parent = frame.parents[pi];
+                const size_t parent_n = git_tree_entrycount(parent);
+
+                // walk parent tree entries
+                while (frame.pidx[pi] < parent_n)
+                {
+                    const git_tree_entry *pe = git_tree_entry_byindex(parent, frame.pidx[pi]);
+                    const char *pname = git_tree_entry_name(pe);
+                    int cmp = strcmp(pname, cname);
+                    if (cmp < 0)
+                    {
+                        // entry was deleted from the current tree
+                        // TODO:
+                        // rename tracking:
+                        // deleted blob oid
+                        // deleted path
+                        frame.pidx[pi]++;
+                        matches[pi] = nullptr;
+                        // continue walking parent tree entries
+                        // until cmp==0 or cmp>0 or end of parent tree
+                        continue;
+                    }
+                    if (cmp == 0)
+                    {
+                        // found match between current and parent tree
+                        matches[pi] = pe;
+                        frame.pidx[pi]++;
+                        break;
+                    }
+
+                    // cmp > 0
+                    // entry was added to the current tree
+                    // current entry missing in this parent
+                    matches[pi] = nullptr;
+                    break;
+                }
+            }
+
+            // process current entry
+
+            std::string path =
+                frame.root.empty()
+                ? std::string(cname)
+                : frame.root + "/" + cname;
+
+            bool identical_in_any_parent = false;
+            bool identical_in_all_parents = true;
+
+            // parent trees for the next iteration
+            std::vector<git_tree*> next_ptrees;
+
+            // TODO why the if condition? why not always do this?
+            if (ctype == GIT_OBJECT_TREE)
+            {
+                next_ptrees.reserve(matches.size());
+            }
+
+            // find entries with identical contents
+            for (size_t pi = 0; pi < matches.size(); ++pi)
+            {
+                const git_tree_entry *pe = matches[pi];
+                if (!pe)
+                {
+                    // no parent entry with identical name
+                    continue;
+                }
+                // parent entry with identical name
+                git_object_t ptype = git_tree_entry_type(pe);
+                if (ptype != ctype)
+                {
+                    // type changed
+                    // TODO? emit add/delete events
+                    identical_in_all_parents = false;
+                    // for tracking of renames, we need all add/delete events
+                    // so we need to recurse into subtrees
+                    if (ptype == GIT_OBJECT_TREE)
+                    {
+                        // parent tree
+                        const git_oid *poid = git_tree_entry_id(pe);
+                        git_tree *ptree = nullptr;
+                        git_tree_lookup(&ptree, ctx->repo, poid);
+                        // NOTE we do not keep track of parent commits
+                        // because we only care about the current commit
+                        // and whether files changed from parent commits
+                        next_ptrees.push_back(ptree);
+                    }
+                    continue;
+                }
+                const git_oid *poid = git_tree_entry_id(pe);
+                if (git_oid_equal(poid, coid))
+                {
+                    // parent entry with identical content
+                    // entry was copied from the parent tree
+                    identical_in_any_parent = true;
+                    // no. for tracking of renames, we need all add/delete events
+                    // break;
+                }
+                else
+                {
+                    // parent entry with different content
+                    identical_in_all_parents = false;
+                }
+                // if (ctype == GIT_OBJECT_TREE)
+                if (ptype == GIT_OBJECT_TREE)
+                {
+                    // parent tree
+                    git_tree *ptree = nullptr;
+                    git_tree_lookup(&ptree, ctx->repo, poid);
+                    // NOTE we do not keep track of parent commits
+                    // because we only care about the current commit
+                    // and whether files changed from parent commits
+                    next_ptrees.push_back(ptree);
+                }
+            }
+
+            if (identical_in_all_parents)
+            {
+                frame.cidx++;
+                continue;
+            }
+
+            if (ctype == GIT_OBJECT_BLOB)
+            {
+                // current blob
+                if (!identical_in_any_parent)
+                {
+                    // blob was added by the current commit
+                    // we found the last-modified time of this file
+                    auto it = ctx->blobs.find(*coid);
+                    if (it != ctx->blobs.end())
+                    {
+                        if (!it->second.has_time)
+                        {
+                            it->second.time = ctx->time;
+                            it->second.has_time = true;
+                            ctx->files_found++;
+                            // output result
+                            // emit the last-modified time as soon as possible
+                            std::cout << it->second.time << " " << it->second.path << "\n";
+                        }
+                    }
+                }
+                // else: blob was copied from some parent commit
+
+                size_t nparents = next_ptrees.size();
+                // TODO what if nparents>0
+                // recurse into subtrees to compare their entries
+            }
+            else if (ctype == GIT_OBJECT_TREE)
+            {
+                // current subtree
+                if (!identical_in_any_parent)
+                {
+                    // subtree was added by the current commit
+                    // recurse into subtrees to compare their entries
+                    git_tree *ctree = nullptr;
+                    git_tree_lookup(&ctree, ctx->repo, coid);
+                    size_t nparents = next_ptrees.size();
+                    // TODO verify: does this work when nparents==0
+                    stack.push_back({
+                        ctree,
+                        std::move(next_ptrees),
+                        std::vector<size_t>(nparents, 0),
+                        0,
+                        path,
+                        true
+                    });
+                }
+                else // identical_in_any_parent == true
+                {
+                    // subtree was copied from some parent commit
+                    for (git_tree *t : next_ptrees)
+                    {
+                        git_tree_free(t);
+                    }
+                }
+            }
+            frame.cidx++;
+        }
+
+        //
+        // flush remaining parent entries
+        //
+
+        for (size_t pi = 0;
+             pi < frame.parents.size();
+             ++pi)
+        {
+            git_tree *parent =
+                frame.parents[pi];
+
+            const size_t parent_n =
+                git_tree_entrycount(parent);
+
+            while (frame.pidx[pi] < parent_n)
+            {
+                const git_tree_entry *pe =
+                    git_tree_entry_byindex(
+                        parent,
+                        frame.pidx[pi]);
+
+                //
+                // delete event
+                //
+
+                // TODO:
+                // rename tracking
+
+                frame.pidx[pi]++;
+            }
+        }
+
+        //
+        // free owned trees
+        //
+
+        if (frame.owns_trees)
+        {
+            git_tree_free(
+                frame.current);
+
+            for (git_tree *t :
+                 frame.parents)
+            {
+                git_tree_free(t);
+            }
+        }
+    }
+}
+```
+
+## Response:
+
+6/21/2026, 5:25:17 PM
+
+I think you're very close now, but there are still a few conceptual bugs.
+
+The biggest one is this:
+
+``` cpp
+if (identical_in_any_parent)
+{
+    // subtree was copied from some parent commit
+    for (git_tree *t : next_ptrees)
+        git_tree_free(t);
+}
+```
+
+This is wrong for merge commits.
+
+Imagine:
+
+``` text
+current:
+  src/
+
+parent1:
+  src/    oid = AAA
+
+parent2:
+  src/    oid = BBB
+```
+
+and
+
+``` text
+current src oid = AAA
+```
+
+Then:
+
+``` cpp
+identical_in_any_parent == true
+```
+
+but:
+
+``` cpp
+parent2 src oid != current src oid
+```
+
+so there may be modifications introduced through the merge.
+
+You cannot skip recursion merely because one parent matches.
+
+The correct question is:
+
+``` cpp
+identical_in_all_parents
+```
+
+not
+
+``` cpp
+identical_in_any_parent
+```
+
+For trees:
+
+``` cpp
+if (identical_in_all_parents)
+{
+    // subtree unchanged relative to every parent
+    skip recursion
+}
+else
+{
+    recurse
+}
+```
+
+because a merge commit is "interesting" whenever at least one parent differs.
+
+------------------------------------------------------------------------
+
+Second issue:
+
+``` cpp
+if (ptype != ctype)
+{
+    ...
+    if (ptype == GIT_OBJECT_TREE)
+        next_ptrees.push_back(ptree);
+}
+```
+
+This is also questionable.
+
+Suppose:
+
+``` text
+parent: foo/
+current: foo
+```
+
+(tree → blob)
+
+You currently recurse into the parent tree.
+
+But conceptually this should be handled as:
+
+``` text
+delete subtree foo/*
+add blob foo
+```
+
+There is no matched subtree pair anymore.
+
+I would not push that tree into `next_ptrees`.
+
+Instead emit delete events for everything under the parent tree.
+
+Likewise:
+
+``` text
+parent: foo
+current: foo/
+```
+
+(blob → tree)
+
+should become:
+
+``` text
+delete blob foo
+add subtree foo/*
+```
+
+not subtree comparison.
+
+------------------------------------------------------------------------
+
+Third issue:
+
+``` cpp
+bool identical_in_all_parents = true;
+```
+
+Initialization is wrong.
+
+Consider:
+
+``` text
+current: foo
+
+parents:
+    parent1 contains foo
+    parent2 does not contain foo
+```
+
+Then:
+
+``` cpp
+matches[0] = foo
+matches[1] = nullptr
+```
+
+Your code leaves:
+
+``` cpp
+identical_in_all_parents == true
+```
+
+because nullptr parents are skipped.
+
+That's incorrect.
+
+You need:
+
+``` cpp
+bool identical_in_all_parents =
+    (matches.size() > 0);
+```
+
+and then:
+
+``` cpp
+if (!pe)
+{
+    identical_in_all_parents = false;
+    continue;
+}
+```
+
+Otherwise an added file can accidentally look identical-to-all.
+
+------------------------------------------------------------------------
+
+Fourth issue:
+
+This comment:
+
+``` cpp
+// TODO why the if condition? why not always do this?
+if (ctype == GIT_OBJECT_TREE)
+{
+    next_ptrees.reserve(matches.size());
+}
+```
+
+You're right.
+
+The condition is pointless.
+
+Just do:
+
+``` cpp
+std::vector<git_tree*> next_ptrees;
+next_ptrees.reserve(matches.size());
+```
+
+always.
+
+------------------------------------------------------------------------
+
+The head-knot question:
+
+> when do i push a new frame?
+
+The answer is surprisingly simple:
+
+Push a frame iff:
+
+``` text
+current entry is a tree
+AND
+the tree is not identical in all parents
+```
+
+In code:
+
+``` cpp
+if (ctype == GIT_OBJECT_TREE &&
+    !identical_in_all_parents)
+{
+    push frame
+}
+```
+
+That's it.
+
+Everything else becomes add/delete events.
+
+------------------------------------------------------------------------
+
+The rename problem actually simplifies the logic.
+
+You don't need to recurse through type-changes.
+
+Instead:
+
+``` text
+blob -> tree
+```
+
+becomes
+
+``` text
+DELETE blob
+ADD subtree contents
+```
+
+and
+
+``` text
+tree -> blob
+```
+
+becomes
+
+``` text
+DELETE subtree contents
+ADD blob
+```
+
+Then your rename detector later sees:
+
+``` text
+DELETE blob oid=X path=A
+ADD    blob oid=X path=B
+```
+
+and converts that into:
+
+``` text
+RENAME A -> B
+```
+
+without ever treating it as a modification.
+
+So I would separate concerns:
+
+1.  compare_tree_nway emits:
+
+    - add blob
+    - delete blob
+    - modified blob
+    - recurse subtree
+
+2.  rename detection runs afterwards on the add/delete sets.
+
+Once you do that, type changes stop being special and the recursion rules become much cleaner.
+
+## Prompt:
+
+6/21/2026, 6:01:49 PM
+
+but then, when emit a "add subtree" event, then when do i recurse into the added subtree to resolve all its blob IDs? because rename-tracking only works when i have
+
+1.  a list of added blob IDs
+2.  a list of deleted blob IDs
+3.  a multimap from blobIDs to file paths
+
+## Response:
+
+6/21/2026, 6:01:52 PM
+
+Exactly. That's why I think you're mixing two different layers:
+
+1.  **Tree comparison layer**
+2.  **Rename detection layer**
+
+The tree comparison layer cannot simply emit:
+
+``` text
+ADD subtree foo/
+```
+
+and stop there.
+
+Because rename detection needs blob OIDs, not tree OIDs.
+
+So for rename tracking, an added subtree must eventually become:
+
+``` text
+ADD blob oid=A path=foo/a.txt
+ADD blob oid=B path=foo/b.txt
+ADD blob oid=C path=foo/c.txt
+...
+```
+
+Likewise a deleted subtree must become:
+
+``` text
+DELETE blob oid=X path=old/x.txt
+DELETE blob oid=Y path=old/y.txt
+DELETE blob oid=Z path=old/z.txt
+...
+```
+
+Therefore:
+
+``` text
+tree -> blob
+```
+
+requires:
+
+1.  recurse into parent tree
+2.  emit DELETE for every blob inside
+3.  emit ADD for the new blob
+
+and
+
+``` text
+blob -> tree
+```
+
+requires:
+
+1.  emit DELETE for old blob
+2.  recurse into current tree
+3.  emit ADD for every blob inside
+
+------------------------------------------------------------------------
+
+I would actually stop thinking in terms of "recurse".
+
+Think in terms of:
+
+``` cpp
+emit_add_blob(...)
+emit_delete_blob(...)
+```
+
+and
+
+``` cpp
+expand_subtree_as_adds(...)
+expand_subtree_as_deletes(...)
+```
+
+For example:
+
+``` cpp
+if (ctype == GIT_OBJECT_TREE &&
+    ptype != GIT_OBJECT_TREE)
+{
+    expand_subtree_as_adds(current_tree);
+}
+```
+
+where
+
+``` cpp
+expand_subtree_as_adds()
+```
+
+walks the subtree and emits one ADD event per blob.
+
+Similarly:
+
+``` cpp
+if (ptype == GIT_OBJECT_TREE &&
+    ctype != GIT_OBJECT_TREE)
+{
+    expand_subtree_as_deletes(parent_tree);
+}
+```
+
+------------------------------------------------------------------------
+
+Even better:
+
+You already have a stack.
+
+So instead of recursive expansion:
+
+``` cpp
+expand_subtree_as_adds(tree)
+```
+
+can push a special frame:
+
+``` cpp
+enum FrameMode
+{
+    Compare,
+    EmitAdds,
+    EmitDeletes
+};
+```
+
+Then:
+
+``` cpp
+stack.push({
+    subtree,
+    {},
+    {},
+    0,
+    path,
+    true,
+    EmitAdds
+});
+```
+
+and later:
+
+``` cpp
+case EmitAdds:
+```
+
+walk every blob under that tree and emit ADD events.
+
+Similarly:
+
+``` cpp
+case EmitDeletes:
+```
+
+walk every blob and emit DELETE events.
+
+No recursion required.
+
+------------------------------------------------------------------------
+
+There's an even bigger simplification.
+
+For your use case you don't actually care about directories at all.
+
+You care about:
+
+``` text
+(blob_oid, path)
+```
+
+pairs.
+
+So the real event stream should be:
+
+``` text
+ADD    oid path
+DELETE oid path
+MODIFY oid path
+```
+
+Trees are merely a mechanism to discover those events.
+
+Once you think that way, the rules become:
+
+### current blob, no matching parent
+
+``` text
+ADD blob
+```
+
+### parent blob, no matching current
+
+``` text
+DELETE blob
+```
+
+### current tree, no matching parent
+
+``` text
+walk subtree
+emit ADD for every blob
+```
+
+### parent tree, no matching current
+
+``` text
+walk subtree
+emit DELETE for every blob
+```
+
+### tree/tree
+
+``` text
+push compare frame
+```
+
+### blob/tree
+
+``` text
+DELETE old blob(s)
+ADD new blob(s)
+```
+
+### tree/blob
+
+``` text
+DELETE old blob(s)
+ADD new blob(s)
+```
+
+Then rename detection is trivial:
+
+``` cpp
+unordered_multimap<oid, deleted_path>
+unordered_multimap<oid, added_path>
+```
+
+and after the frame finishes:
+
+``` text
+DELETE oid=A path=old.c
+ADD    oid=A path=new.c
+```
+
+becomes:
+
+``` text
+RENAME old.c -> new.c
+```
+
+without ever involving tree logic again.
+
+That's the architecture I'd use. The tree walker's only responsibility is producing a complete stream of blob-level add/delete/modify events. Rename detection becomes a separate pass over those events.
+
+## Prompt:
+
+6/21/2026, 6:35:53 PM
+
+ok, give me a full compare_tree_nway function to find the last-modified times of all files in the HEAD tree, tracking renames, so renames are not treated as "file modified" events
+
+## Response:
+
+6/21/2026, 6:35:55 PM
+
+I don't think I can honestly give you a *correct* full implementation yet, because there is still a fundamental issue unresolved:
+
+> tracking renames while walking multiple branch histories in parallel.
+
+Earlier I thought you could just do:
+
+``` text
+DELETE oid=X path=A
+ADD    oid=X path=B
+=> rename
+```
+
+but that's only correct within a single history.
+
+As you pointed out, during revwalk you can be simultaneously traversing:
+
+``` text
+HEAD
+ |
+ M
+/ \
+A  B
+```
+
+and a rename may exist only on branch A.
+
+So at commit B, the file may still be:
+
+``` text
+foo.c
+```
+
+while at commit A it has become:
+
+``` text
+bar.c
+```
+
+Meaning there is no single current path for blob X.
+
+------------------------------------------------------------------------
+
+This means `compare_tree_nway` cannot directly solve rename tracking.
+
+You need an explicit file-state model.
+
+Something like:
+
+``` cpp
+struct BlobState
+{
+    bool has_time = false;
+    git_time_t time = 0;
+
+    std::unordered_set<std::string> paths;
+};
+```
+
+or more likely
+
+``` cpp
+struct BlobState
+{
+    bool has_time = false;
+    git_time_t time = 0;
+
+    std::vector<PathVersion> paths;
+};
+
+struct PathVersion
+{
+    std::string path;
+    uint32_t branch_mask;
+};
+```
+
+because paths are branch-dependent.
+
+------------------------------------------------------------------------
+
+So I would split the problem.
+
+### Step 1
+
+Get a correct N-way tree comparison.
+
+Ignore renames.
+
+Emit:
+
+``` cpp
+AddBlob(path, oid)
+DeleteBlob(path, oid)
+ModifyBlob(path, old_oid, new_oid)
+```
+
+events.
+
+------------------------------------------------------------------------
+
+### Step 2
+
+Decide how branch-aware rename tracking should work.
+
+Because that's the hard part.
+
+You need to answer:
+
+> When commit A renames foo→bar, and commit B doesn't, what is the "current path" of this file while both histories are still alive?
+
+Until that's answered, no implementation will be correct.
+
+------------------------------------------------------------------------
+
+For the purpose of finding last-modified times of HEAD files, I actually suspect the solution is much simpler:
+
+You do **not** need general rename tracking.
+
+You only care about blobs reachable from HEAD.
+
+So for every blob in HEAD:
+
+``` cpp
+HEAD path -> blob oid
+```
+
+you can walk backwards and track the blob oid.
+
+When a rename happens:
+
+``` text
+old/path.c oid=X
+new/path.c oid=X
+```
+
+the blob oid stays identical.
+
+Therefore the file identity is the blob lineage, not the path.
+
+The path only matters when looking up the blob in a tree.
+
+------------------------------------------------------------------------
+
+That suggests storing:
+
+``` cpp
+unordered_map<git_oid, FileInfo>
+```
+
+exactly as you're already doing.
+
+Then the tree walker should operate entirely on blob OIDs.
+
+A rename becomes:
+
+``` text
+DELETE path=A oid=X
+ADD    path=B oid=X
+```
+
+which produces:
+
+``` cpp
+deleted_oids.insert(X);
+added_oids.insert(X);
+```
+
+and since the OID is unchanged, no modification timestamp gets assigned.
+
+------------------------------------------------------------------------
+
+In other words:
+
+I would not try to finish a giant `compare_tree_nway()` yet.
+
+I would first define precisely:
+
+``` cpp
+emit_add_blob(path, oid)
+emit_delete_blob(path, oid)
+emit_modify_blob(path, old_oid, new_oid)
+```
+
+and define exactly how those affect:
+
+``` cpp
+ctx->blobs
+```
+
+for merge commits and renames.
+
+Once that event model is nailed down, the tree walker becomes straightforward. Right now the rename semantics are still changing, so any "full implementation" I give would likely be wrong and need rewriting.
+
+## Prompt:
+
+6/21/2026, 6:53:09 PM
+
+> I don't think I can honestly give you a *correct* full implementation yet, because there is still a fundamental issue unresolved:
+
+the good news is that we can simplify this problem by completely ignoring file paths, and only tracking blob IDs, because we need the file paths (and file times) only for the output. internally, we can simplify the problem to tracking blob IDs.
+
+so what is currently unsolved is...
+
+1.  the generation of "add blob" and "delete blob" events (including "recursion" into "add subtree" and "delete subtree" events, to produce all the corresponding "add blob" and "delete blob" events)
+
+2.  the "postprocessing" stage, where we try to pair "add blob" and "delete blob" events by their blob ID, and if we find such a pair, then the blob was renamed, then we clear the blob time and set has_time=false, so the actual file-modified time will be set in a future iteration
+
+give me an implementation of such a compare_tree_nway function
+
+## Response:
+
+6/21/2026, 6:53:09 PM
+
+Yes. With the simplification
+
+``` text
+file identity == blob oid
+```
+
+the problem becomes much cleaner.
+
+In fact, I would stop trying to assign timestamps inside the tree walk.
+
+Instead:
+
+``` cpp
+compare_tree_nway(...)
+```
+
+should only produce events:
+
+``` cpp
+struct BlobEvent
+{
+    enum Type {
+        Add,
+        Delete,
+    };
+
+    Type type;
+    git_oid oid;
+};
+```
+
+Then after the entire commit is processed:
+
+``` cpp
+process_events(events);
+```
+
+does:
+
+``` text
+Delete X + Add X  => rename/copy => ignore
+Delete X only     => blob disappeared
+Add X only        => blob introduced by this commit
+```
+
+and only then updates `ctx->blobs`.
+
+This avoids all the head knots.
+
+------------------------------------------------------------------------
+
+I would add to Context:
+
+``` cpp
+struct Context
+{
+    ...
+
+    std::vector<git_oid> added_blobs;
+    std::vector<git_oid> deleted_blobs;
+};
+```
+
+------------------------------------------------------------------------
+
+Helper:
+
+``` cpp
+static void emit_add_blob(
+    const git_oid *oid,
+    Context *ctx)
+{
+    ctx->added_blobs.push_back(*oid);
+}
+
+static void emit_delete_blob(
+    const git_oid *oid,
+    Context *ctx)
+{
+    ctx->deleted_blobs.push_back(*oid);
+}
+```
+
+------------------------------------------------------------------------
+
+Helper for subtree expansion:
+
+``` cpp
+static void emit_tree_as_adds(
+    git_tree *tree,
+    Context *ctx)
+{
+    std::vector<git_tree*> stack;
+    stack.push_back(tree);
+
+    while (!stack.empty())
+    {
+        git_tree *t = stack.back();
+        stack.pop_back();
+
+        size_t n =
+            git_tree_entrycount(t);
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            const git_tree_entry *e =
+                git_tree_entry_byindex(t, i);
+
+            git_object_t type =
+                git_tree_entry_type(e);
+
+            const git_oid *oid =
+                git_tree_entry_id(e);
+
+            if (type == GIT_OBJECT_BLOB)
+            {
+                emit_add_blob(
+                    oid,
+                    ctx);
+            }
+            else if (type == GIT_OBJECT_TREE)
+            {
+                git_tree *sub = nullptr;
+
+                git_tree_lookup(
+                    &sub,
+                    ctx->repo,
+                    oid);
+
+                stack.push_back(sub);
+            }
+        }
+
+        if (t != tree)
+            git_tree_free(t);
+    }
+}
+```
+
+Delete version is identical:
+
+``` cpp
+static void emit_tree_as_deletes(
+    git_tree *tree,
+    Context *ctx)
+{
+    ...
+    emit_delete_blob(...)
+    ...
+}
+```
+
+------------------------------------------------------------------------
+
+Then compare_tree_nway becomes much simpler.
+
+For every synchronized name:
+
+### blob/blob
+
+``` cpp
+if (git_oid_equal(poid, coid))
+{
+    // unchanged
+}
+else
+{
+    emit_delete_blob(poid, ctx);
+    emit_add_blob(coid, ctx);
+}
+```
+
+### blob/missing
+
+``` cpp
+emit_add_blob(coid, ctx);
+```
+
+### missing/blob
+
+``` cpp
+emit_delete_blob(poid, ctx);
+```
+
+### tree/tree
+
+``` cpp
+if (!git_oid_equal(poid, coid))
+{
+    push compare frame
+}
+```
+
+### tree/missing
+
+``` cpp
+emit_tree_as_adds(ctree, ctx);
+```
+
+### missing/tree
+
+``` cpp
+emit_tree_as_deletes(ptree, ctx);
+```
+
+### blob/tree
+
+``` cpp
+emit_delete_blob(poid, ctx);
+emit_tree_as_adds(ctree, ctx);
+```
+
+### tree/blob
+
+``` cpp
+emit_tree_as_deletes(ptree, ctx);
+emit_add_blob(coid, ctx);
+```
+
+------------------------------------------------------------------------
+
+After compare_tree_nway returns:
+
+``` cpp
+static void process_blob_events(Context *ctx)
+{
+    std::unordered_set<git_oid, OidHash> adds;
+    std::unordered_set<git_oid, OidHash> dels;
+
+    for (auto &oid : ctx->added_blobs)
+        adds.insert(oid);
+
+    for (auto &oid : ctx->deleted_blobs)
+        dels.insert(oid);
+
+    //
+    // remove renames/copies
+    //
+
+    for (auto it = adds.begin();
+         it != adds.end(); )
+    {
+        if (dels.contains(*it))
+        {
+            dels.erase(*it);
+            it = adds.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    //
+    // remaining adds are true introductions
+    //
+
+    for (const auto &oid : adds)
+    {
+        auto f =
+            ctx->blobs.find(oid);
+
+        if (f == ctx->blobs.end())
+            continue;
+
+        if (!f->second.has_time)
+        {
+            f->second.time =
+                ctx->time;
+
+            f->second.has_time =
+                true;
+
+            ctx->files_found++;
+        }
+    }
+
+    ctx->added_blobs.clear();
+    ctx->deleted_blobs.clear();
+}
+```
+
+This gives you:
+
+``` text
+rename:
+    delete X
+    add X
+ -> canceled
+
+copy:
+    add X
+ -> canceled if X already existed in another parent
+
+modify:
+    delete old_oid
+    add new_oid
+ -> add(new_oid) survives
+
+merge modification:
+    current oid differs from every parent oid
+ -> add(current_oid) survives
+
+pure merge:
+    current oid identical to some parent oid
+ -> no surviving add
+```
+
+and the tree walker itself no longer needs to know anything about renames. It only emits blob-level add/delete events.
 
 ------------------------------------------------------------------------
 
