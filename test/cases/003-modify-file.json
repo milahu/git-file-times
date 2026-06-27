@@ -1,0 +1,25 @@
+{
+  "description": "Expected: a.txt -> 2",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "a.txt",
+      "content": "one\n"
+    }],
+
+    ["commit", {
+      "message": "add"
+    }],
+
+    ["append", {
+      "path": "a.txt",
+      "content": "two\n"
+    }],
+
+    ["commit", {
+      "message": "modify",
+      "modified": ["a.txt"]
+    }]
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "description": "Expected: a -> 1, b -> 1. Both paths point to the same blob.",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "a",
+      "content": "hello"
+    }],
+
+    ["commit", {
+      "message": "add"
+    }],
+
+    ["copy", {
+      "src": "a",
+      "dst": "b"
+    }],
+
+    ["commit", {
+      "message": "copy"
+    }]
+  ]
+}

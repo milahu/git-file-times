@@ -1,0 +1,7 @@
+{
+  "description": "expected output: no files",
+  "steps": [
+    ["init"],
+    ["commit", { "message": "initial empty commit", "args": ["--allow-empty"]}]
+  ]
+}

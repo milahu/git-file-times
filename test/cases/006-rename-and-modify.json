@@ -1,0 +1,29 @@
+{
+  "description": "expected: new -> 2",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "old",
+      "content": "hello"
+    }],
+
+    ["commit", {
+      "message": "add"
+    }],
+
+    ["rename", {
+      "src": "old",
+      "dst": "new"
+    }],
+
+    ["append", {
+      "path": "new",
+      "content": " world"
+    }],
+
+    ["commit", {
+      "message": "rename+modify"
+    }]
+  ]
+}

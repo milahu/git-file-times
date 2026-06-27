@@ -1,0 +1,23 @@
+{
+  "description": "expected: no files",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "a",
+      "content": "hello"
+    }],
+
+    ["commit", {
+      "message": "add"
+    }],
+
+    ["delete", {
+      "path": "a"
+    }],
+
+    ["commit", {
+      "message": "delete"
+    }]
+  ]
+}

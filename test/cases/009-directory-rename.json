@@ -1,0 +1,29 @@
+{
+  "description": "Expected: newdir/a -> 1, newdir/b -> 1. This exercises subtree recursion.",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "dir/a",
+      "content": "A"
+    }],
+
+    ["write", {
+      "path": "dir/b",
+      "content": "B"
+    }],
+
+    ["commit", {
+      "message": "add"
+    }],
+
+    ["rename", {
+      "src": "dir",
+      "dst": "newdir"
+    }],
+
+    ["commit", {
+      "message": "rename dir"
+    }]
+  ]
+}

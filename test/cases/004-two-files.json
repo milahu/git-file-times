@@ -1,0 +1,29 @@
+{
+  "description": "expected: a -> 2, b -> 1",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "a",
+      "content": "A"
+    }],
+
+    ["write", {
+      "path": "b",
+      "content": "B"
+    }],
+
+    ["commit", {
+      "message": "add"
+    }],
+
+    ["append", {
+      "path": "a",
+      "content": "!"
+    }],
+
+    ["commit", {
+      "message": "modify a"
+    }]
+  ]
+}

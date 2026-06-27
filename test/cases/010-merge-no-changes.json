@@ -1,0 +1,41 @@
+{
+  "description": "Expected: a -> 1. This checks our 'identical subtree in one parent means ignore the other parents' logic.",
+  "steps": [
+    ["init"],
+
+    ["write", {
+      "path": "a",
+      "content": "hello"
+    }],
+
+    ["commit", {
+      "message": "base"
+    }],
+
+    ["branch", {
+      "name": "side"
+    }],
+
+    ["checkout", {
+      "name": "side"
+    }],
+
+    ["commit", {
+      "message": "empty side commit",
+      "args": ["--allow-empty"]
+    }],
+
+    ["checkout", {
+      "name": "main"
+    }],
+
+    ["commit", {
+      "message": "empty main commit",
+      "args": ["--allow-empty"]
+    }],
+
+    ["merge", {
+      "branch": "side"
+    }]
+  ]
+}
